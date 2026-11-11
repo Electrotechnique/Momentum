@@ -811,15 +811,19 @@ public:
     void setReverbEffectTime(float value)
     {
         reverbEffectTime = value;
-        shared.reverb.roomsize(reverbEffectTime);
+        if (shared.reverb)
+            shared.reverb->size(reverbEffectTime);
     }
 
     void setReverbEffectMix(float value)
     {
         reverbEffectMix = value;
-        // Mix is up to 50:50
-        shared.reverbMixer.gain(0, 1.0f - (reverbEffectMix / 2.0f)); // Dry
-        shared.reverbMixer.gain(1, reverbEffectMix / 2.0f);          // Wet
+        if (!shared.reverb)
+            return;
+        // Mix is up to 50:50, as with the previous reverb
+        shared.reverb->mix(reverbEffectMix / 2.0f);
+        // Bypassed at zero mix to save CPU time
+        shared.reverb->bypass_set(reverbEffectMix <= 0.0f);
     }
 
     inline void setMonophonic(uint8_t mode)

@@ -43,14 +43,15 @@ struct PatchShared
     AudioMixer4 voiceMixerM;
 
     AudioEffectEnsemble ensemble;
-    AudioEffectFreeverb reverb;
     AudioFilterDCBlock dcOffsetFilter;
     AudioMixer4 volumeMixer;
     AudioMixer4 ensembleEffectMixerL;
     AudioMixer4 ensembleEffectMixerR;
-    AudioMixer4 reverbMixer;
+    // The reverb is shared by all timbres and follows the ensemble (see Global).
+    // Set by Global; one instance because each needs ~120KB of RAM2.
+    AudioEffectPlateReverb *reverb = nullptr;
 
-    AudioConnection connections[15] = {
+    AudioConnection connections[12] = {
         {pitchBend, 0, pitchMixer, 0},
         {pitchLfo, 0, pitchMixer, 1},
         {voiceMixer[0], 0, voiceMixerM, 0},
@@ -58,14 +59,11 @@ struct PatchShared
         {voiceMixer[2], 0, voiceMixerM, 2},
         {voiceMixerM, 0, dcOffsetFilter, 0},
         {dcOffsetFilter, 0, volumeMixer, 0},
-        {volumeMixer, 0, reverb, 0},
-        {volumeMixer, 0, reverbMixer, 0},
-        {reverb, 0, reverbMixer, 1},
-        {reverbMixer, 0, ensemble, 0},
+        {volumeMixer, 0, ensemble, 0},
         {ensemble, 0, ensembleEffectMixerL, 1},
         {ensemble, 1, ensembleEffectMixerR, 1},
-        {reverbMixer, 0, ensembleEffectMixerL, 0},
-        {reverbMixer, 0, ensembleEffectMixerR, 0},
+        {volumeMixer, 0, ensembleEffectMixerL, 0},
+        {volumeMixer, 0, ensembleEffectMixerR, 0},
     };
 
 private:
@@ -187,7 +185,6 @@ public:
         pwaConnection = new AudioConnection(shared.pwa, 0, pwMixer_a, 1);
         pwbConnection = new AudioConnection(shared.pwb, 0, pwMixer_b, 1);
         noiseMixerConnection = new AudioConnection(shared.noiseMixer, 0, waveformMixer_, 2);
-        shared.reverb.damping(0.5f); // TODO Replace with control
         uint8_t voiceMixerIndex = 0;
         uint8_t indexMod4 = index % 4;
         if (index != 0)
@@ -214,24 +211,27 @@ public:
     AudioMixer4 effectMixerRM;
     AudioMixer4 ensembleEffectMixerL[3];
     AudioMixer4 effectMixerLM;
+    AudioEffectPlateReverb reverb; // Stereo, in series after the ensemble
     AudioOutputI2S i2s;
 
     PatchShared SharedAudio[MAX_NO_TIMBER];
     Patch Oscillators[MAX_NO_VOICE];
 
-    AudioConnection connectionsArray[12] = {
+    AudioConnection connectionsArray[14] = {
         {ensembleEffectMixerL[0], 0, effectMixerLM, 0},
         {ensembleEffectMixerL[1], 0, effectMixerLM, 1},
         {ensembleEffectMixerL[2], 0, effectMixerLM, 2},
         {ensembleEffectMixerR[0], 0, effectMixerRM, 0},
         {ensembleEffectMixerR[1], 0, effectMixerRM, 1},
         {ensembleEffectMixerR[2], 0, effectMixerRM, 2},
-        {effectMixerLM, 0, scope, 0},
-        {effectMixerLM, 0, peak, 0},
-        {effectMixerRM, 0, usbAudio, 1},
-        {effectMixerRM, 0, i2s, 1},
-        {effectMixerLM, 0, i2s, 0},
-        {effectMixerLM, 0, usbAudio, 0}};
+        {effectMixerLM, 0, reverb, 0},
+        {effectMixerRM, 0, reverb, 1},
+        {reverb, 0, scope, 0},
+        {reverb, 0, peak, 0},
+        {reverb, 1, usbAudio, 1},
+        {reverb, 1, i2s, 1},
+        {reverb, 0, i2s, 0},
+        {reverb, 0, usbAudio, 0}};
 
     std::vector<AudioConnection *> connections;
 
@@ -243,8 +243,16 @@ public:
             connections.push_back(new AudioConnection{constant1Dc, 0, Oscillators[i].filterModMixer_, 2}); // Key tracking
         }
 
+        // Fixed reverb tone settings (0.0 - 1.0). Size and mix are patch parameters.
+        reverb.hidamp(0.5f);   // Treble loss in the tail
+        reverb.lodamp(0.2f);   // Bass loss in the tail, keeps low notes from muddying
+        reverb.lowpass(0.3f);  // Reverb output treble cut
+        reverb.hipass(0.0f);   // Reverb output bass cut
+        reverb.diffusion(1.0f);
+
         for (int i = 0; i < MAX_NO_TIMBER; i++)
         {
+            SharedAudio[i].reverb = &reverb;
             SharedAudio[i].connectNoise(pink, white);
 
             uint8_t mixerIdx = 0;

@@ -58,7 +58,7 @@
 
 #include "output_dacs.h"
 #include "effect_ensemble.h" //Electrotechnique exclusive stereo emsemble effect
-#include "effect_freeverb.h"
+#include "effect_platereverb.h" //Stereo plate reverb from hexefx_audiolib_i16 (trimmed local version)
 #include "effect_envelope.h" //Local version
 #include "effect_combine.h"  //Local version
 #include "filter_variable.h" //Local version
