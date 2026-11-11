@@ -128,7 +128,7 @@ FLASHMEM void recallPatch(uint8_t bank, long patchUID);
 FLASHMEM void recallPerformance(uint8_t filename);
 FLASHMEM void myControlChange(byte channel, byte control, byte value);
 FLASHMEM void usbHostControlChange(byte channel, byte control, byte value);
-FLASHMEM void myMIDIClock();
+void myMIDIClock();
 FLASHMEM void myMIDIClockContinue();
 FLASHMEM void myMIDIClockStart();
 FLASHMEM void myMIDIClockStop();
@@ -155,6 +155,24 @@ int voiceToReturn = -1;      // Initialise
 
 uint8_t seq_last_step = 0;
 uint8_t loopCount = 0;
+#define MIDI_READS_PER_LOOP 16 // Max pending messages handled per MIDI input each time they're read
+
+// Blocks the audio update while note changes are applied, so envelope triggers and pitch
+// changes land in the same audio block. Safe to nest and to use from the sequencer timer ISR:
+// the audio interrupt is only re-enabled if it was enabled on entry.
+class AudioUpdateLock
+{
+public:
+    AudioUpdateLock() : wasEnabled(NVIC_IS_ENABLED(IRQ_SOFTWARE)) { NVIC_DISABLE_IRQ(IRQ_SOFTWARE); }
+    ~AudioUpdateLock()
+    {
+        if (wasEnabled)
+            NVIC_ENABLE_IRQ(IRQ_SOFTWARE);
+    }
+
+private:
+    const bool wasEnabled;
+};
 
 FLASHMEM void setup()
 {
@@ -300,7 +318,8 @@ FLASHMEM void setup()
 }
 
 // Specifically for Sequencer, bypassing recording note in and arp
-FLASHMEM void noteOn(byte channel, byte note, byte velocity)
+// Note handlers run from RAM: flash cache misses add latency/jitter (also called from the sequencer ISR)
+void noteOn(byte channel, byte note, byte velocity)
 {
     // Check for out of range notes. Less than 20Hz isn't really audible
     if (note + groupvec[activeGroupIndex]->params().oscPitchA < 10 ||
@@ -308,10 +327,11 @@ FLASHMEM void noteOn(byte channel, byte note, byte velocity)
         note + groupvec[activeGroupIndex]->params().oscPitchB < 10 ||
         note + groupvec[activeGroupIndex]->params().oscPitchB > 127)
         return;
+    AudioUpdateLock lock;
     groupvec[activeGroupIndex]->noteOn(note, velocity);
 }
 
-FLASHMEM void myNoteOn(byte channel, byte note, byte velocity)
+void myNoteOn(byte channel, byte note, byte velocity)
 {
     if (arpRunning)
     {
@@ -405,12 +425,13 @@ FLASHMEM void myNoteOn(byte channel, byte note, byte velocity)
     }
 }
 
-FLASHMEM void noteOff(byte channel, byte note, byte velocity)
+void noteOff(byte channel, byte note, byte velocity)
 {
+    AudioUpdateLock lock;
     groupvec[activeGroupIndex]->noteOff(note);
 }
 
-FLASHMEM void myNoteOff(byte channel, byte note, byte velocity)
+void myNoteOff(byte channel, byte note, byte velocity)
 {
     if (arpRunning)
     {
@@ -444,7 +465,7 @@ FLASHMEM void updatePatchnameAndIndex(String name, uint32_t index, uint32_t UID)
     setPatchNoAndNameForDisp(String(index), name);
 }
 
-FLASHMEM void myPitchBend(byte channel, int bend)
+void myPitchBend(byte channel, int bend)
 {
     groupvec[activeGroupIndex]->pitchBend(bend * currentPatch.PitchBend * DIV12xDIV8192);
 }
@@ -1325,7 +1346,7 @@ FLASHMEM void myMIDIClockStop()
     MIDIClkSignal = false;
 }
 
-FLASHMEM void myMIDIClock()
+void myMIDIClock()
 {
     MIDIClkSignal = true;
     // 24ppq this is for 4/4 time, alternates between noteon and noteoff, 8 times
@@ -3141,12 +3162,17 @@ void loop()
     if (loopCount++ > 15)
     {
         checkUSBHostStatus();
+        // Drain pending MIDI messages (bounded) so notes aren't queued behind clock/CC traffic.
+        // read() returns false straight away when nothing is waiting.
         // USB Host MIDI Class Compliant
-        usbHostMIDI.read(midiChannel);
+        for (uint8_t i = 0; i < MIDI_READS_PER_LOOP && usbHostMIDI.read(midiChannel); i++)
+            ;
         // USB Client MIDI
-        usbMIDI.read(midiChannel);
+        for (uint8_t i = 0; i < MIDI_READS_PER_LOOP && usbMIDI.read(midiChannel); i++)
+            ;
         // MIDI 5 Pin DIN
-        MIDI.read(midiChannel);
+        for (uint8_t i = 0; i < MIDI_READS_PER_LOOP && MIDI.read(midiChannel); i++)
+            ;
         sdCardDetect();
         sequencerLEDs();
         // if (DEBUG)

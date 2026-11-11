@@ -18,6 +18,8 @@
 #define SPICLOCK_READ 80'000'000
 
 #define DISPLAYTIMEOUT 700
+#define DISPLAY_FRAME_MS 30    // Minimum time between screen refreshes (~33fps max)
+#define DISPLAY_THREAD_TICKS 1 // Display thread time slice in 1ms ticks. Main loop (MIDI) waits at most this long
 
 #include "Voice.h"
 #include <utils.h>
@@ -1684,11 +1686,29 @@ FLASHMEM void enableScope(boolean enable)
   enable ? global.scope.ScreenSetup(&tft) : global.scope.ScreenSetup(NULL);
 }
 
+// Send the frame buffer to the display using DMA so the CPU is free during the
+// SPI transfer (~18ms for a full 320x240 frame). Falls back to a blocking update.
+void updateScreenDMA()
+{
+  global.scope.Display(); // Draws only if the scope is enabled
+  if (tft.updateScreenAsync(false))
+  {
+    while (tft.asyncUpdateActive())
+      threads.yield();
+  }
+  else
+  {
+    tft.updateScreen();
+  }
+}
+
 void displayThread()
 {
   threads.delay(1500); // Give bootup page chance to display
+  elapsedMillis frameTime;
   while (1)
   {
+    frameTime = 0;
     if ((millis() - timer) > DISPLAYTIMEOUT)
     {
       switch (state)
@@ -1701,12 +1721,12 @@ void displayThread()
         break;
       case State::SAVE:
         renderSavePage();
-        tft.updateScreen(); // update before delay
+        updateScreenDMA(); // update before delay
         threads.delay(1000);
         break;
       case State::REINITIALISE:
         renderReinitialisePage();
-        tft.updateScreen(); // update before delay
+        updateScreenDMA(); // update before delay
         threads.delay(1000);
         break;
       case State::PATCHSAVING:
@@ -1722,12 +1742,12 @@ void displayThread()
         break;
       case State::DELETEMSG:
         renderDeleteMessagePage();
-        tft.updateScreen(); // update before delay
+        updateScreenDMA(); // update before delay
         threads.delay(1000);
         break;
       case State::DELETEBANKMSG:
         renderDeleteBankMessagePage();
-        tft.updateScreen(); // update before delay
+        updateScreenDMA(); // update before delay
         threads.delay(1000);
         break;
       case State::SETTINGS:
@@ -1854,7 +1874,10 @@ void displayThread()
     {
       renderCurrentParameterOverlay();
     }
-    tft.updateScreen();
+    updateScreenDMA();
+    // Yield the CPU back to the main loop (MIDI handling) for the rest of the frame
+    if (frameTime < DISPLAY_FRAME_MS)
+      threads.delay(DISPLAY_FRAME_MS - frameTime);
   }
 }
 
@@ -1867,7 +1890,10 @@ void setupDisplay()
   tft.setTextWrap(false);
   renderBootUpPage();
   tft.updateScreen();
-  threads.addThread(displayThread);
+  int displayThreadId = threads.addThread(displayThread);
+  // Default slice is 10ms, which could hold off MIDI note handling by up to 10ms
+  if (displayThreadId > 0)
+    threads.setTimeSlice(displayThreadId, DISPLAY_THREAD_TICKS);
 }
 
 #endif

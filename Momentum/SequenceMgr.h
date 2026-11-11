@@ -53,7 +53,7 @@ extern void myNoteOff(byte channel, byte note, byte velocity);
 extern void noteOff(byte channel, byte note, byte velocity);
 extern void noteOn(byte channel, byte note, byte velocity);
 
-FLASHMEM void noteOffRoutine();
+void noteOffRoutine();
 
 uint8_t currentSeqPosition = 0; // 1.1.1
 uint8_t currentSeqNote = 60;    // C3
@@ -606,7 +606,8 @@ FLASHMEM void seq_live_recording()
     }
 }
 
-FLASHMEM void noteOnRoutine()
+// Sequencer/arpeggiator step code runs from the timer ISR, so keep it in RAM for steady timing
+void noteOnRoutine()
 {
     if (arpRunning)
     {
@@ -728,7 +729,7 @@ FLASHMEM void noteOnRoutine()
     seqSwapper = false;
 }
 
-FLASHMEM void noteOffRoutine()
+void noteOffRoutine()
 {
     if (arpRunning)
     {
@@ -756,7 +757,7 @@ FLASHMEM void noteOffRoutine()
 }
 
 // Runs in Interrupt Timer. Switches between the Noteon and Noteoff Task, each cycle
-FLASHMEM void sequencer()
+void sequencer()
 {
     // if (currentSequence.running && state == SEQUENCEEDIT)
     //     currentSequence.recording = true;

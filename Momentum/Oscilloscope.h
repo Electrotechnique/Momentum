@@ -20,8 +20,10 @@ class Oscilloscope : public AudioStream {
 
   private:
     audio_block_t *inputQueueArray[1];
-    ILI9341_t3n *display;
-    int16_t buffer[AUDIO_BLOCK_SAMPLES];
+    ILI9341_t3n *display = NULL;
+    int16_t buffer[AUDIO_BLOCK_SAMPLES];        // Being captured by the audio interrupt
+    int16_t displayBuffer[AUDIO_BLOCK_SAMPLES]; // Last complete capture
+    int16_t drawBuffer[AUDIO_BLOCK_SAMPLES];    // Display thread's copy (not on its small stack)
 };
 #endif
 
@@ -30,8 +32,17 @@ FLASHMEM void Oscilloscope::ScreenSetup(ILI9341_t3n *screen)
     display = screen;
 }
 
+// Called from the display thread before each screen update. Drawing used to be done
+// in the audio interrupt, which cost audio CPU time and raced with the display thread.
 void Oscilloscope::Display()
 {
+  if (!display)
+    return;
+  __disable_irq();
+  memcpy(drawBuffer, displayBuffer, sizeof(drawBuffer));
+  __enable_irq();
+  const int16_t *buffer = drawBuffer;
+
   pixel_x = 0;
   prev_pixel_y = map(buffer[0], 32767, -32768, -120, 120) + 200;
   if (prev_pixel_y < 167)
@@ -90,7 +101,7 @@ void Oscilloscope::update(void)
     release(block);
     if (bufferBlock == 0)
     {
-      Display();
+      memcpy(displayBuffer, buffer, sizeof(displayBuffer));
     }
   }
 }
