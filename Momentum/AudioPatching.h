@@ -226,12 +226,13 @@ public:
         {ensembleEffectMixerR[2], 0, effectMixerRM, 2},
         {effectMixerLM, 0, reverb, 0},
         {effectMixerRM, 0, reverb, 1},
-        {reverb, 0, scope, 0},
         {reverb, 0, peak, 0},
         {reverb, 1, usbAudio, 1},
         {reverb, 1, i2s, 1},
         {reverb, 0, i2s, 0},
-        {reverb, 0, usbAudio, 0}};
+        {reverb, 0, usbAudio, 0},
+        // Scope taps the voices before the effects (DC removed, before volume) for a clean trace
+        {SharedAudio[0].dcOffsetFilter, 0, scope, 0}};
 
     std::vector<AudioConnection *> connections;
 
