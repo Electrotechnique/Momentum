@@ -3153,7 +3153,8 @@ FLASHMEM void sequencerLEDs()
 
 FLASHMEM void CPUMonitor()
 {
-    Serial.printf(" CPU:%f (%f)  MEM:%f\n", AudioProcessorUsage(), AudioProcessorUsageMax(), AudioMemoryUsageMax());
+    // Memory is in audio blocks (an integer), out of the AudioMemory() allocation in setup()
+    Serial.printf(" CPU:%.1f (%.1f)  MEM:%u (%u)\n", AudioProcessorUsage(), AudioProcessorUsageMax(), (unsigned)AudioMemoryUsage(), (unsigned)AudioMemoryUsageMax());
 }
 
 void loop()
