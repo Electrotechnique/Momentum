@@ -3153,8 +3153,26 @@ FLASHMEM void sequencerLEDs()
 
 FLASHMEM void CPUMonitor()
 {
-    // Memory is in audio blocks (an integer), out of the AudioMemory() allocation in setup()
-    Serial.printf(" CPU:%.1f (%.1f)  MEM:%u (%u)\n", AudioProcessorUsage(), AudioProcessorUsageMax(), (unsigned)AudioMemoryUsage(), (unsigned)AudioMemoryUsageMax());
+    // Once a second: printing every loop floods USB serial and can stall the main loop
+    static elapsedMillis sincePrint;
+    if (sincePrint < 1000)
+        return;
+    sincePrint = 0;
+    // Memory is in audio blocks (an integer), out of the AudioMemory() allocation in setup().
+    // Stack is the most the display thread has used, out of DISPLAY_THREAD_STACK.
+    Serial.printf(" CPU:%.1f (%.1f)  MEM:%u (%u)  Display stack:%u/%u\n", AudioProcessorUsage(), AudioProcessorUsageMax(),
+                  (unsigned)AudioMemoryUsage(), (unsigned)AudioMemoryUsageMax(), (unsigned)displayStackUsed(), (unsigned)DISPLAY_THREAD_STACK);
+}
+
+// Prints the details of the last crash (if any) once the Serial Monitor is connected
+FLASHMEM void crashReportCheck()
+{
+    static bool checked = false;
+    if (checked || !Serial)
+        return;
+    checked = true;
+    if (CrashReport)
+        Serial.print(CrashReport);
 }
 
 void loop()
@@ -3176,8 +3194,9 @@ void loop()
             ;
         sdCardDetect();
         sequencerLEDs();
-        // if (DEBUG)
-        //     CPUMonitor();
+        crashReportCheck();
+        // Uncomment for CPU, audio memory and display stack figures (printed once a second)
+        // CPUMonitor();
         loopCount = 0;
     }
     encoders.read();

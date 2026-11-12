@@ -20,6 +20,8 @@
 #define DISPLAYTIMEOUT 700
 #define DISPLAY_FRAME_MS 30    // Minimum time between screen refreshes (~33fps max)
 #define DISPLAY_THREAD_TICKS 1 // Display thread time slice in 1ms ticks. Main loop (MIDI) waits at most this long
+#define DISPLAY_THREAD_STACK 8192 // bytes. TeensyThreads' default 1KB was too small for font and String rendering
+#define DISPLAY_STACK_FILL 0xA5   // Unused stack pattern, for measuring the most stack used
 
 #include "Voice.h"
 #include <utils.h>
@@ -1909,6 +1911,19 @@ void displayThread()
   }
 }
 
+// Display thread stack in fast RAM (DTCM). The default stack is 1KB allocated on the heap,
+// so an overflow silently corrupted the heap.
+static uint8_t displayThreadStack[DISPLAY_THREAD_STACK] __attribute__((aligned(8)));
+
+// Most display thread stack ever used, in bytes (for CPUMonitor)
+uint32_t displayStackUsed()
+{
+  uint32_t i = 0;
+  while (i < DISPLAY_THREAD_STACK && displayThreadStack[i] == DISPLAY_STACK_FILL)
+    i++;
+  return DISPLAY_THREAD_STACK - i;
+}
+
 void setupDisplay()
 {
   tft.begin(SPI_SPEED, SPICLOCK_READ);
@@ -1918,7 +1933,8 @@ void setupDisplay()
   tft.setTextWrap(false);
   renderBootUpPage();
   tft.updateScreen();
-  int displayThreadId = threads.addThread(displayThread);
+  memset(displayThreadStack, DISPLAY_STACK_FILL, sizeof(displayThreadStack));
+  int displayThreadId = threads.addThread(displayThread, 0, DISPLAY_THREAD_STACK, displayThreadStack);
   // Default slice is 10ms, which could hold off MIDI note handling by up to 10ms
   if (displayThreadId > 0)
     threads.setTimeSlice(displayThreadId, DISPLAY_THREAD_TICKS);
