@@ -72,12 +72,14 @@ public:
   void init_sawtooth (uint32_t freq_word) ;
   void init_square (uint32_t freq_word) ;
   void init_pulse (uint32_t freq_word, uint32_t pulse_width) ;
+  // Band-limited variable triangle (rising for pulse_width of the cycle)
+  int16_t generate_triangle_variable (uint32_t new_phase, uint32_t pulse_width, int i) ;
+  void init_triangle_variable (uint32_t freq_word) ;
   
 
 private:
-  int32_t lookup (int offset) ;
+  inline int32_t lookup (int offset) ;
   void insert_step (int offset, bool rising, int i) ;
-  int32_t process_step (int i) ;
   int32_t process_active_steps (uint32_t new_phase) ;
   int32_t process_active_steps_saw (uint32_t new_phase) ;
   int32_t process_active_steps_pulse (uint32_t new_phase, uint32_t pulse_width) ;
@@ -88,12 +90,34 @@ private:
   
   uint32_t phase_word ;
   int32_t dc_offset ;
-  step_state states [32] ; // circular buffer of active steps
-  int newptr ;         // buffer pointers into states, AND'd with PTRMASK to keep in buffer range.
-  int delptr ;
   int32_t  cyclic[16] ;    // circular buffer of output samples
+  // Each step's level change is applied as soon as it is made; what is left of its
+  // band-limited shape (a residual that dies away) is added to these future samples.
+  int32_t future [32] ;
+  int fut_pos ;
+  void reset_steps (void) ;
   bool pulse_state ;
   uint32_t sampled_width ; // pulse width is sampled once per waveform
+
+  // Variable triangle: its slope (+2/W rising, -2/(1-W) falling, per cycle) is made with
+  // band-limited steps of any size, one per corner, then integrated. The width is latched
+  // at the start of each cycle and only sets the size of that cycle's corners, so width
+  // changes are exact. Same 16 sample delay as the other waveforms.
+  float vt_future [32] ;  // residuals of corner steps still playing out, as future[]
+  int vt_fpos ;
+  float vt_level ;       // slope, including the full size of every corner so far
+  float vt_cyc [16] ;    // delayed slope samples
+  float vt_dph [16] ;    // phase step per sample, delayed to match
+  float vt_ref [16] ;    // plain triangle, delayed, for drift correction
+  float vt_y ;           // integrator, +/-1
+  float vt_w ;           // latched width
+  uint32_t vt_w32 ;
+  bool vt_rising ;
+  bool vt_sync ;         // align to the real phase on the next sample
+  uint32_t vt_inc ;
+  void vt_insert (uint32_t dist, uint32_t dphase, float amp, int i) ;
+  int16_t vt_step (uint32_t new_phase, uint32_t pulse_width, int i) ;
+  inline float vt_ref_at (uint32_t phase) ;
 };
 
 
@@ -231,6 +255,8 @@ public:
       band_limit_waveform.init_square (phase_increment) ;
     else if (t_type == WAVEFORM_BANDLIMIT_PULSE)
       band_limit_waveform.init_pulse (phase_increment, 0x80000000u) ;
+    else if (t_type == WAVEFORM_TRIANGLE_VARIABLE)
+      band_limit_waveform.init_triangle_variable (phase_increment) ;
     else if (t_type == WAVEFORM_BANDLIMIT_SAWTOOTH || t_type == WAVEFORM_BANDLIMIT_SAWTOOTH_REVERSE)
       band_limit_waveform.init_sawtooth (phase_increment) ;
   }
