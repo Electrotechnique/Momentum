@@ -606,7 +606,8 @@ FLASHMEM void seq_live_recording()
     }
 }
 
-// Sequencer/arpeggiator step code runs from the timer ISR, so keep it in RAM for steady timing
+// Sequencer/arpeggiator step code (run by the TeensyTimerTool TCK timer from yield(), on the
+// main thread) is kept in RAM for steady timing
 void noteOnRoutine()
 {
     if (arpRunning)

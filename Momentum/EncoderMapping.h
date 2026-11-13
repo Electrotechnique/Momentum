@@ -20,6 +20,7 @@ EncoderMappingStruct encMap[4] = {};
 // Sets the value and value string of the encoder when this parameter is on the display
 FLASHMEM boolean setEncValue(boolean act, uint8_t parameter, uint8_t value, String str, uint8_t newParameter)
 {
+    LockGuard lock(displayLock); // The display renders from encMap
     for (uint8_t i = 0; i < 4; i++)
     {
         if (encMap[i].Parameter == parameter)
@@ -40,6 +41,7 @@ FLASHMEM boolean setEncValue(boolean act, uint8_t parameter, uint8_t value, Stri
 
 FLASHMEM boolean setEncValue(uint8_t parameter, uint8_t value, uint8_t range, String str)
 {
+    LockGuard lock(displayLock); // The display renders from encMap
     // Extra routine for settings which have variable size ranges
     for (uint8_t i = 0; i < 4; i++)
     {
@@ -54,12 +56,14 @@ FLASHMEM boolean setEncValue(uint8_t parameter, uint8_t value, uint8_t range, St
 
 FLASHMEM boolean setEncValue(uint8_t parameter, uint8_t value, String str)
 {
+    LockGuard lock(displayLock); // The display renders from encMap
     return setEncValue(true, parameter, value, str, parameter);
 }
 
 // For turning off
 FLASHMEM boolean setEncInactive(uint8_t parameter)
 {
+    LockGuard lock(displayLock); // The display renders from encMap
     return setEncValue(false, parameter, 0, "", parameter);
 }
 
@@ -1059,6 +1063,7 @@ FLASHMEM void setDefaultValue(EncoderMappingStruct *enc)
 // groupvec[activeGroupIndex]->XXX stores absolute, real values
 FLASHMEM void setEncodersState(State s)
 {
+    LockGuard lock(displayLock); // The display renders from encMap
     switch (s)
     {
     case State::MAIN:
@@ -1907,6 +1912,7 @@ FLASHMEM void setEncodersState(State s)
 
 FLASHMEM void setConfigurationForCC(uint8_t enc, uint8_t cc)
 {
+    LockGuard lock(displayLock); // The display renders from encMap
     switch (cc)
     {
     case CCunison:

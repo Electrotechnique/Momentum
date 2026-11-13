@@ -59,6 +59,7 @@
 #include <MIDI.h>
 #include <USBHost_t36.h>
 #include <TeensyThreads.h>
+#include "ThreadSafety.h"
 #include <TeensyTimerTool.h>
 using namespace TeensyTimerTool;
 #include "MidiCC.h"
@@ -156,10 +157,12 @@ int voiceToReturn = -1;      // Initialise
 uint8_t seq_last_step = 0;
 uint8_t loopCount = 0;
 #define MIDI_READS_PER_LOOP 16 // Max pending messages handled per MIDI input each time they're read
+// Set while flushing MIDI input on Panic: incoming messages are read and dropped
+volatile boolean midiDiscard = false;
 
 // Blocks the audio update while note changes are applied, so envelope triggers and pitch
-// changes land in the same audio block. Safe to nest and to use from the sequencer timer ISR:
-// the audio interrupt is only re-enabled if it was enabled on entry.
+// changes land in the same audio block. Safe to nest: the audio interrupt is only re-enabled
+// if it was enabled on entry.
 class AudioUpdateLock
 {
 public:
@@ -318,7 +321,7 @@ FLASHMEM void setup()
 }
 
 // Specifically for Sequencer, bypassing recording note in and arp
-// Note handlers run from RAM: flash cache misses add latency/jitter (also called from the sequencer ISR)
+// Note handlers run from RAM: flash cache misses add latency/jitter (also called by the sequencer/arp)
 void noteOn(byte channel, byte note, byte velocity)
 {
     // Check for out of range notes. Less than 20Hz isn't really audible
@@ -333,6 +336,8 @@ void noteOn(byte channel, byte note, byte velocity)
 
 void myNoteOn(byte channel, byte note, byte velocity)
 {
+    if (midiDiscard)
+        return; // Panic is flushing the MIDI inputs
     if (arpRunning)
     {
         // If it's in hold mode and you are not holding any notes down,
@@ -433,6 +438,8 @@ void noteOff(byte channel, byte note, byte velocity)
 
 void myNoteOff(byte channel, byte note, byte velocity)
 {
+    if (midiDiscard)
+        return; // Panic is flushing the MIDI inputs
     if (arpRunning)
     {
         if (arpNotesHeld > 0)
@@ -467,12 +474,17 @@ FLASHMEM void updatePatchnameAndIndex(String name, uint32_t index, uint32_t UID)
 
 void myPitchBend(byte channel, int bend)
 {
+    if (midiDiscard)
+        return; // Panic is flushing the MIDI inputs
     groupvec[activeGroupIndex]->pitchBend(bend * currentPatch.PitchBend * DIV12xDIV8192);
 }
 
 // MIDI CC
 FLASHMEM void myControlChange(byte channel, byte control, byte value)
 {
+    if (midiDiscard)
+        return; // Panic is flushing the MIDI inputs
+    LockGuard lock(displayLock); // The display renders from the state changed here
     if (DEBUG)
         Serial.printf("Ch:%u: cc=%d, v=%d\n", channel, control, value);
     if (sendCC)
@@ -483,7 +495,9 @@ FLASHMEM void myControlChange(byte channel, byte control, byte value)
     case CCvolume:
         currentVolume = value;
         storeVolumeToEEPROM(value);
-        groupvec[activeGroupIndex]->setVolume(LINEAR[currentVolume] * MAX_VOL);
+        // Audio taper: level = knob^2, so half way is -12dB rather than -6dB (most of the
+        // change used to be in the bottom fifth of the travel). Maximum is unchanged.
+        groupvec[activeGroupIndex]->setVolume(LINEAR[currentVolume] * LINEAR[currentVolume] * MAX_VOL);
         showCurrentParameterOverlay(ParameterStrMap[CCvolume], LINEAR[currentVolume]);
         break;
     case CCunison:
@@ -1224,6 +1238,9 @@ FLASHMEM void myControlChange(byte channel, byte control, byte value)
 
 FLASHMEM void myProgramChange(byte channel, byte program)
 {
+    if (midiDiscard)
+        return; // Panic is flushing the MIDI inputs
+    LockGuard lock(displayLock); // The display renders from the state changed here
     if (state == State::PERFORMANCEPAGE || state == State::PERFORMANCERECALL)
     {
         if (program < PERFORMANCES_LIMIT)
@@ -1303,6 +1320,8 @@ FLASHMEM void sequencerStop()
 
 FLASHMEM void myMIDIClockContinue()
 {
+    if (midiDiscard)
+        return; // Panic is flushing the MIDI inputs
     if (!currentSequence.running)
     {
         seqMidiSync = true;
@@ -1313,6 +1332,8 @@ FLASHMEM void myMIDIClockContinue()
 
 FLASHMEM void myMIDIClockStart()
 {
+    if (midiDiscard)
+        return; // Panic is flushing the MIDI inputs
     if ((!currentSequence.running && !seqMidiSync) || arpRunning)
         seqMidiSync = true;
     midiClkCount = 0;
@@ -1336,6 +1357,8 @@ FLASHMEM void myMIDIClockStart()
 
 FLASHMEM void myMIDIClockStop()
 {
+    if (midiDiscard)
+        return; // Panic is flushing the MIDI inputs
     if (seqMidiSync && syncToMIDIClk)
     {
         sequencerStop();
@@ -1348,6 +1371,8 @@ FLASHMEM void myMIDIClockStop()
 
 void myMIDIClock()
 {
+    if (midiDiscard)
+        return; // Panic is flushing the MIDI inputs
     MIDIClkSignal = true;
     // 24ppq this is for 4/4 time, alternates between noteon and noteoff, 8 times
     if (seqMidiSync && syncToMIDIClk && currentSequence.running && (midiClkCount % 3) == 0)
@@ -1395,8 +1420,16 @@ FLASHMEM void silence()
     groupvec[activeGroupIndex]->closeEnvelopes();
 }
 
+// Debounced patch recall, see selectPatchForRecall()
+#define PATCH_RECALL_DELAY_MS 150
+boolean patchRecallPending = false;
+boolean patchRecallUpdatesPerformance = false;
+elapsedMillis patchRecallTimer;
+
 FLASHMEM void recallPatch(uint8_t bank, long patchUID)
 {
+    LockGuard lock(displayLock); // The display renders from the state changed here
+    patchRecallPending = false;  // A direct recall replaces a pending one
     if (patchUID == 0)
         return;
     silence();
@@ -1415,8 +1448,36 @@ FLASHMEM void recallPatch(uint8_t bank, long patchUID)
     }
 }
 
+// Turning the patch or bank encoder only selects and shows the patch. It is recalled once the
+// encoder has been still for PATCH_RECALL_DELAY_MS, rather than on every detent: each recall
+// reads the SD card, sets every parameter and writes EEPROM, which a fast turn did dozens of
+// times a second (freezes on TSynth).
+FLASHMEM void selectPatchForRecall(boolean updatePerformance)
+{
+    setPatchNoAndNameForDisp(String(currentPatchIndex + 1), patches[currentPatchIndex].patchName);
+    patchRecallPending = true;
+    patchRecallUpdatesPerformance = updatePerformance;
+    patchRecallTimer = 0;
+}
+
+FLASHMEM void checkPendingPatchRecall()
+{
+    if (!patchRecallPending || patchRecallTimer < PATCH_RECALL_DELAY_MS)
+        return;
+    LockGuard lock(displayLock);
+    patchRecallPending = false;
+    recallPatch(currentBankIndex, patches[currentPatchIndex].patchUID);
+    if (patchRecallUpdatesPerformance)
+    {
+        currentPerformance.patches[0].bankIndex = currentBankIndex;
+        currentPerformance.patches[0].UID = patches[currentPatchIndex].patchUID;
+        currentPerformance.patches[0].patchName = currentPatchName;
+    }
+}
+
 FLASHMEM void recallPerformance(uint8_t filename)
 {
+    LockGuard lock(displayLock); // The display renders from the state changed here
     silence();
     if (loadPerformance(filename))
     {
@@ -1458,6 +1519,7 @@ FLASHMEM void recallPerformance(uint8_t filename)
 
 FLASHMEM void recallSequence(uint8_t filename)
 {
+    LockGuard lock(displayLock); // The display renders from the state changed here
     silence();
     if (!loadSequence(filename))
     {
@@ -1610,6 +1672,7 @@ FLASHMEM int8_t encScaling(EncoderMappingStruct *enc, int8_t delta)
 
 FLASHMEM void encoderCallback(unsigned enc_idx, int value, int delta)
 {
+    LockGuard lock(displayLock); // The display renders from the state changed here
     // --- Value isn't used because it's absolute values that don't change with changes to the encoder assignment---
     if (DEBUG)
         Serial.printf("enc[%u]: v=%d, d=%d\n", enc_idx, value, delta);
@@ -1647,7 +1710,7 @@ FLASHMEM void encoderCallback(unsigned enc_idx, int value, int delta)
             newDelta > 0 ? incCurrentPatchIndex() : decCurrentPatchIndex();
             if (state == State::MAIN || state == State::DELETEPATCH)
             {
-                recallPatch(currentBankIndex, patches[currentPatchIndex].patchUID);
+                selectPatchForRecall(false);
             }
             else if (state == State::PATCHSAVING)
             {
@@ -1655,10 +1718,7 @@ FLASHMEM void encoderCallback(unsigned enc_idx, int value, int delta)
             }
             else if (state == State::PERFORMANCEPATCHEDIT)
             {
-                recallPatch(currentBankIndex, patches[currentPatchIndex].patchUID);
-                currentPerformance.patches[0].bankIndex = currentBankIndex;
-                currentPerformance.patches[0].UID = patches[currentPatchIndex].patchUID;
-                currentPerformance.patches[0].patchName = currentPatchName;
+                selectPatchForRecall(true);
             }
             break;
         case CCbankselectLSB:
@@ -1676,7 +1736,7 @@ FLASHMEM void encoderCallback(unsigned enc_idx, int value, int delta)
             {
                 currentBankIndex = tempBankIndex;
                 currentPatchIndex = patches.size() - 1;
-                recallPatch(currentBankIndex, patches[currentPatchIndex].patchUID);
+                selectPatchForRecall(false);
             }
             else
             {
@@ -1686,7 +1746,7 @@ FLASHMEM void encoderCallback(unsigned enc_idx, int value, int delta)
                 }
                 currentBankIndex = tempBankIndex;
                 currentPatchIndex = 0;
-                recallPatch(currentBankIndex, patches[currentPatchIndex].patchUID);
+                selectPatchForRecall(false);
             }
             break;
         case savebankselect:
@@ -1940,6 +2000,7 @@ FLASHMEM void encoderCallback(unsigned enc_idx, int value, int delta)
 
 FLASHMEM void encoderButtonCallback(unsigned enc_idx, int buttonState)
 {
+    LockGuard lock(displayLock); // The display renders from the state changed here
     // Subtract 4 from encoder index due to numbering on shift registers
     enc_idx -= 4;
 
@@ -2325,8 +2386,41 @@ FLASHMEM void encoderButtonCallback(unsigned enc_idx, int buttonState)
     }
 }
 
+// Read and drop everything waiting in the MIDI inputs, so a backlog from a flood of MIDI
+// doesn't keep playing after Panic. Bounded in time in case the sender keeps going.
+#define MIDI_FLUSH_MAX_MS 50
+FLASHMEM void flushMidiInput()
+{
+    midiDiscard = true;
+    elapsedMillis t;
+    bool more = true;
+    while (more && t < MIDI_FLUSH_MAX_MS)
+    {
+        more = false;
+        myusb.Task();
+        if (usbHostMIDI.read()) // USB host
+            more = true;
+        if (usbMIDI.read()) // USB device
+            more = true;
+    }
+    // 5 pin DIN: drop the unread bytes without parsing them, so they aren't sent to MIDI thru
+    Serial1.clear();
+    midiDiscard = false;
+}
+
+// Panic: drop any MIDI waiting to be read, then silence all voices at once
+FLASHMEM void midiPanic()
+{
+    flushMidiInput();
+    AudioNoInterrupts();
+    groupvec[activeGroupIndex]->panic();
+    AudioInterrupts();
+    showCurrentParameterOverlay(F("Panic"), F("All notes off"));
+}
+
 FLASHMEM void buttonCallback(unsigned button_idx, int buttonStatus)
 {
+    LockGuard lock(displayLock); // The display renders from the state changed here
     /*
       Button1 SR1 D4  10
       Button2 SR2 D4  9
@@ -2844,8 +2938,8 @@ FLASHMEM void buttonCallback(unsigned button_idx, int buttonStatus)
                 return;
             if (state != State::FXPAGE1 && state != State::FXPAGE2)
             {
-                // If Back button held, Panic - all notes off
-                silence();
+                // If Back button held, Panic: drop any MIDI waiting to be read, then all notes off
+                midiPanic();
                 flashLED(GREEN, 6, 250);
             }
             else
@@ -3073,6 +3167,7 @@ void midiCCOut(byte cc, byte value)
 
 FLASHMEM void sdCardDetect()
 {
+    LockGuard lock(displayLock); // The display renders from the state changed here
     if (sdCardInterrupt)
     {
         silence();
@@ -3201,4 +3296,7 @@ void loop()
     }
     encoders.read();
     buttons.read();
+    // Start note-ons that were waiting for a stolen voice to fade out
+    groupvec[activeGroupIndex]->serviceVoices();
+    checkPendingPatchRecall();
 }

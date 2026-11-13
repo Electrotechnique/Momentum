@@ -500,6 +500,7 @@ FLASHMEM void renderVoiceGrid()
 
 FLASHMEM void setPatchNoAndNameForDisp(String number, String patchName)
 {
+  LockGuard lock(displayLock);
   currentPgmNum = number;
   currentPatchName = patchName;
 }
@@ -1660,6 +1661,7 @@ FLASHMEM void showCurrentParameterOverlay2(const char *param, float val, int pTy
 {
   if (!updateDisplay)
     return;
+  LockGuard lock(displayLock);
   currentParameter = param;
   currentValue = String(val);
   currentFloatValue = val;
@@ -1672,6 +1674,7 @@ FLASHMEM void showCurrentParameterOverlay(String param, String val, int pType)
   // Prevents all the changing parameters showing when a patch is loaded
   if (!updateDisplay)
     return;
+  LockGuard lock(displayLock);
   currentParameter = param;
   currentValue = val;
   paramType = pType;
@@ -1723,8 +1726,20 @@ void updateScreenDMA()
   global.scope.Display(); // Draws only if the scope is enabled
   if (tft.updateScreenAsync(false))
   {
+    // A full frame takes ~18ms. Report a stalled transfer, to tell it apart from other
+    // causes should the display freeze (the driver's T4 DMA has a single completion
+    // interrupt, so it isn't expected)
+    elapsedMillis waiting;
+    bool reported = false;
     while (tft.asyncUpdateActive())
+    {
+      if (!reported && waiting > 500)
+      {
+        reported = true;
+        Serial.println(F("DMA screen update stalled"));
+      }
       threads.yield();
+    }
   }
   else
   {
@@ -1739,6 +1754,10 @@ void displayThread()
   while (1)
   {
     frameTime = 0;
+    uint32_t pauseMs = 0;
+    // Render into the frame buffer while holding the lock, so the main loop can't change
+    // the Strings, encoder map and lists being drawn. The SPI transfer below runs without it.
+    displayLock.lock();
     if ((millis() - timer) > DISPLAYTIMEOUT)
     {
       switch (state)
@@ -1751,13 +1770,11 @@ void displayThread()
         break;
       case State::SAVE:
         renderSavePage();
-        updateScreenDMA(); // update before delay
-        threads.delay(1000);
+        pauseMs = 1000; // Shown for a second, below (not while holding the lock)
         break;
       case State::REINITIALISE:
         renderReinitialisePage();
-        updateScreenDMA(); // update before delay
-        threads.delay(1000);
+        pauseMs = 1000; // Shown for a second, below (not while holding the lock)
         break;
       case State::PATCHSAVING:
         renderPatchSavingPage();
@@ -1772,13 +1789,11 @@ void displayThread()
         break;
       case State::DELETEMSG:
         renderDeleteMessagePage();
-        updateScreenDMA(); // update before delay
-        threads.delay(1000);
+        pauseMs = 1000; // Shown for a second, below (not while holding the lock)
         break;
       case State::DELETEBANKMSG:
         renderDeleteBankMessagePage();
-        updateScreenDMA(); // update before delay
-        threads.delay(1000);
+        pauseMs = 1000; // Shown for a second, below (not while holding the lock)
         break;
       case State::SETTINGS:
         renderSettingsPage();
@@ -1904,7 +1919,10 @@ void displayThread()
     {
       renderCurrentParameterOverlay();
     }
+    displayLock.unlock();
     updateScreenDMA();
+    if (pauseMs)
+      threads.delay(pauseMs);
     // Yield the CPU back to the main loop (MIDI handling) for the rest of the frame
     if (frameTime < DISPLAY_FRAME_MS)
       threads.delay(DISPLAY_FRAME_MS - frameTime);
