@@ -638,6 +638,20 @@ FLASHMEM void configureCCfilterres(EncoderMappingStruct *enc, State st = State::
     enc->PushAction = st;
 }
 
+// Filter type text: LP...HP mix, then HP fading into BP at the top of the knob, then BP
+FLASHMEM String filterMixerStr(float value)
+{
+    if (value == BANDPASS || value >= 2.0f)
+        return F("Band Pass");
+    if (value > 1.0f)
+        return F("High ") + String(100 - int(100 * (value - 1.0f) + 0.5f)) + F(" - ") + String(int(100 * (value - 1.0f) + 0.5f)) + F(" Band");
+    if (value == LOWPASS)
+        return F("Low Pass");
+    if (value == HIGHPASS)
+        return F("High Pass");
+    return F("Low ") + String(100 - int(100 * value)) + F(" - ") + String(int(100 * value)) + F(" High");
+}
+
 FLASHMEM void configureCCfiltermixer(EncoderMappingStruct *enc, State st = State::MAIN)
 {
     enc->active = true;
@@ -645,26 +659,7 @@ FLASHMEM void configureCCfiltermixer(EncoderMappingStruct *enc, State st = State
     enc->ShowValue = true;
     enc->Value = currentPatch.FilterMixer;
     enc->DefaultValue = 0;
-    if (groupvec[activeGroupIndex]->getFilterMixer() == BANDPASS)
-    {
-        enc->ValueStr = "Band Pass";
-    }
-    else
-    {
-        // LP-HP mix mode - a notch filter
-        if (groupvec[activeGroupIndex]->getFilterMixer() == LOWPASS)
-        {
-            enc->ValueStr = "Low Pass";
-        }
-        else if (groupvec[activeGroupIndex]->getFilterMixer() == HIGHPASS)
-        {
-            enc->ValueStr = "High Pass";
-        }
-        else
-        {
-            enc->ValueStr = "Low " + String(100 - int(100 * groupvec[activeGroupIndex]->getFilterMixer())) + " - " + String(int(100 * groupvec[activeGroupIndex]->getFilterMixer())) + " High";
-        }
-    }
+    enc->ValueStr = filterMixerStr(groupvec[activeGroupIndex]->getFilterMixer());
     enc->Range = 127;
     enc->ParameterStr = ParameterStrMap[CCfiltermixer];
     enc->Push = true;

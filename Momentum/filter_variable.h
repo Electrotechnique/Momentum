@@ -92,22 +92,35 @@ public:
 	// Soft limit the outputs above 75% of full scale instead of hard clipping.
 	// On by default; turn off for utility filters that must stay linear (DC blocker).
 	void softClip(bool enable) { soft_clip = enable; }
+	// Mix the lowpass, bandpass and highpass inside the filter and send only that, on output 0
+	// (outputs 1 and 2 are then unused). Gain changes are smoothed over a block, the soft
+	// limiter acts on the mixed signal, and the bandpass is scaled to unity peak gain (times
+	// 1/Q) so its level matches the other two at any resonance.
+	void mix(float lp, float bp, float hp) {
+		mix_lp = lp; mix_bp = bp; mix_hp = hp;
+		mix_mode = true;
+	}
 	virtual void update(void);
 private:
 	bool soft_clip = true;
+	bool mix_mode = false;
+	float mix_lp = 1.0f, mix_bp = 0.0f, mix_hp = 0.0f;             // targets
+	float mix_lp_now = 1.0f, mix_bp_now = 0.0f, mix_hp_now = 0.0f; // reached at the end of the last block
+	void mix_fixed_point(const int16_t *lp, const int16_t *bp, const int16_t *hp, int16_t *out);
 	int32_t setting_input_gain = 65536; // Q16
 	void update_fixed(const int16_t *in,
 		int16_t *lp, int16_t *bp, int16_t *hp);
 	void update_variable(const int16_t *in, const int16_t *ctl,
 		int16_t *lp, int16_t *bp, int16_t *hp);
 	void update_tpt(const int16_t *in, const int16_t *ctl,
-		int16_t *lp, int16_t *bp, int16_t *hp);
+		int16_t *lp, int16_t *bp, int16_t *hp, int16_t *mixout);
 	// TPT filter: targets set by frequency()/resonance()/octaveControl(), the values
 	// reached at the end of the last block (changes are ramped over a block), and state
 	float tpt_log2fc = 9.966f, tpt_k = 1.414f, tpt_gain = 1.0f, tpt_oct = 1.0f;
 	float tpt_log2fc_now = 0, tpt_k_now = 0, tpt_gain_now = 0, tpt_oct_now = 0;
 	bool tpt_started = false;
 	float tpt_s1 = 0, tpt_s2 = 0;
+	float tpt_g = 0, tpt_hc = 0; // coefficients at the last update point
 	int32_t setting_fcenter;
 	int32_t setting_fmult;
 	int32_t setting_octavemult;

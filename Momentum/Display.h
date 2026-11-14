@@ -1720,10 +1720,14 @@ float scopePeriodSamples()
   return AUDIO_SAMPLE_RATE_EXACT / (freq * tuningCentsFrac);
 }
 
-void updateScreenDMA()
+// The oscilloscope is drawn on the main page only (it used to be drawn over every page)
+void updateScreenDMA(bool showScope = false)
 {
-  global.scope.setPeriod(scopePeriodSamples());
-  global.scope.Display(); // Draws only if the scope is enabled
+  if (showScope)
+  {
+    global.scope.setPeriod(scopePeriodSamples());
+    global.scope.Display(); // Draws only if the scope is enabled
+  }
   if (tft.updateScreenAsync(false))
   {
     // A full frame takes ~18ms. Report a stalled transfer, to tell it apart from other
@@ -1755,6 +1759,7 @@ void displayThread()
   {
     frameTime = 0;
     uint32_t pauseMs = 0;
+    bool showScope = false;
     // Render into the frame buffer while holding the lock, so the main loop can't change
     // the Strings, encoder map and lists being drawn. The SPI transfer below runs without it.
     displayLock.lock();
@@ -1764,6 +1769,7 @@ void displayThread()
       {
       case State::MAIN:
         renderMainPage();
+        showScope = true;
         break;
       case State::PATCHLIST:
         renderPatchRecallPage();
@@ -1920,7 +1926,7 @@ void displayThread()
       renderCurrentParameterOverlay();
     }
     displayLock.unlock();
-    updateScreenDMA();
+    updateScreenDMA(showScope);
     if (pauseMs)
       threads.delay(pauseMs);
     // Yield the CPU back to the main loop (MIDI handling) for the rest of the frame

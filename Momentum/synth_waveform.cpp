@@ -51,6 +51,10 @@ void AudioSynthWaveformTS::update(void)
     phase_accumulator = 0;
     syncFlag = 0;
   }                      
+  if (phaseSetFlag) {
+    phase_accumulator = pendingPhase;
+    phaseSetFlag = 0;
+  }
   ph = phase_accumulator + phase_offset;
   if (magnitude == 0) {
     phase_accumulator += inc * AUDIO_BLOCK_SAMPLES;
@@ -215,6 +219,23 @@ void AudioSynthWaveformTS::update(void)
   }
   phase_accumulator = ph - phase_offset;
 
+  // Smooth the jumps of the stepped waveforms (LFO use)
+  if (smooth_k > 0.0f && (tone_type == WAVEFORM_SQUARE || tone_type == WAVEFORM_PULSE ||
+      tone_type == WAVEFORM_SAWTOOTH || tone_type == WAVEFORM_SAWTOOTH_REVERSE ||
+      tone_type == WAVEFORM_SAMPLE_HOLD)) {
+    bp = block->data;
+    float y = smooth_started ? smooth_y : bp[0];
+    const float k = smooth_k;
+    for (i = 0; i < AUDIO_BLOCK_SAMPLES; i++) {
+      y += k * (bp[i] - y);
+      bp[i] = (int16_t)y;
+    }
+    smooth_y = y;
+    smooth_started = true;
+  } else {
+    smooth_started = false;
+  }
+
   if (tone_offset) {
     bp = block->data;
     end = bp + AUDIO_BLOCK_SAMPLES;
@@ -240,6 +261,15 @@ void AudioSynthWaveformModulatedTS::update(void)
 
   moddata = receiveReadOnly(0);
   shapedata = receiveReadOnly(1);
+
+  if (suspended) {
+    // Voice is silent: keep the phase moving, but produce nothing (so the filter and
+    // mixers after it have nothing to process either)
+    if (moddata) release(moddata);
+    if (shapedata) release(shapedata);
+    phase_accumulator += inc * AUDIO_BLOCK_SAMPLES;
+    return;
+  }
 
   if(syncFlag==1){
     phase_accumulator = 0;
@@ -388,21 +418,12 @@ void AudioSynthWaveformModulatedTS::update(void)
   case WAVEFORM_BANDLIMIT_PULSE:
     if (shapedata)
     {
-      for (i=0; i < AUDIO_BLOCK_SAMPLES; i++)
-      {
-        uint32_t width = ((shapedata->data[i] + 0x8000) & 0xFFFF) << 16;
-        int32_t val = band_limit_waveform.generate_pulse (phasedata[i], width, i) ;
-        *bp++ = (int16_t) ((val * magnitude) >> 16) ;
-      }
+      band_limit_waveform.generate_pulse_block (phasedata, shapedata->data, bp, magnitude) ;
       break;
     } // else fall through to orginary square without shape modulation
 
   case WAVEFORM_BANDLIMIT_SQUARE:
-    for (i = 0 ; i < AUDIO_BLOCK_SAMPLES ; i++)
-    {
-      int32_t val = band_limit_waveform.generate_square (phasedata[i], i) ;
-      *bp++ = (int16_t) ((val * magnitude) >> 16) ;
-    }
+    band_limit_waveform.generate_square_block (phasedata, bp, magnitude) ;
     break;
 
   case WAVEFORM_SAWTOOTH:
@@ -419,22 +440,13 @@ void AudioSynthWaveformModulatedTS::update(void)
 
   case WAVEFORM_BANDLIMIT_SAWTOOTH:
   case WAVEFORM_BANDLIMIT_SAWTOOTH_REVERSE:
-    for (i = 0 ; i < AUDIO_BLOCK_SAMPLES ; i++)
-    {
-      int16_t val = band_limit_waveform.generate_sawtooth (phasedata[i], i) ;
-      val = (int16_t) ((val * magnitude) >> 16) ;
-      *bp++ = tone_type == WAVEFORM_BANDLIMIT_SAWTOOTH_REVERSE ? (int16_t) -val : (int16_t) +val ;
-    }
+    band_limit_waveform.generate_sawtooth_block (phasedata, bp, magnitude, tone_type == WAVEFORM_BANDLIMIT_SAWTOOTH_REVERSE) ;
     break;
 
   case WAVEFORM_TRIANGLE_VARIABLE:
     if (shapedata) {
       // Band-limited (the plain version aliased badly at high pitches and extreme widths)
-      for (i=0; i < AUDIO_BLOCK_SAMPLES; i++) {
-        uint32_t width = ((shapedata->data[i] + 0x8000) & 0xFFFF) << 16;
-        int32_t val = band_limit_waveform.generate_triangle_variable (phasedata[i], width, i) ;
-        *bp++ = (int16_t) ((val * magnitude) >> 16) ;
-      }
+      band_limit_waveform.generate_triangle_variable_block (phasedata, shapedata->data, bp, magnitude) ;
       break;
     } // else fall through to orginary triangle without shape modulation
 
@@ -581,7 +593,7 @@ void BandLimitedWaveformTS::reset_steps (void)
 }
 
 // Waveform value for the current sample from the steps: level plus residuals
-int32_t BandLimitedWaveformTS::process_active_steps (uint32_t new_phase)
+inline int32_t BandLimitedWaveformTS::process_active_steps (uint32_t new_phase)
 {
   const int k = fut_pos & 31 ;
   int32_t sample = dc_offset + future [k] ;
@@ -591,7 +603,7 @@ int32_t BandLimitedWaveformTS::process_active_steps (uint32_t new_phase)
 }
 
 // for sawtooth need to add in the slope and compensate for all the steps being one way
-int32_t BandLimitedWaveformTS::process_active_steps_saw (uint32_t new_phase)
+inline int32_t BandLimitedWaveformTS::process_active_steps_saw (uint32_t new_phase)
 {
   int32_t sample = process_active_steps (new_phase) ;
 
@@ -604,7 +616,7 @@ int32_t BandLimitedWaveformTS::process_active_steps_saw (uint32_t new_phase)
 }
 
 // for pulse need to adjust the baseline according to the pulse width to cancel the DC component.
-int32_t BandLimitedWaveformTS::process_active_steps_pulse (uint32_t new_phase, uint32_t pulse_width)
+inline int32_t BandLimitedWaveformTS::process_active_steps_pulse (uint32_t new_phase, uint32_t pulse_width)
 {
   int32_t sample = process_active_steps (new_phase) ;
 
@@ -616,7 +628,7 @@ int32_t BandLimitedWaveformTS::process_active_steps_pulse (uint32_t new_phase, u
 }
 
 // Check for new steps using the phase update for the current sample for a square wave
-void BandLimitedWaveformTS::new_step_check_square (uint32_t new_phase, int i)
+inline void BandLimitedWaveformTS::new_step_check_square (uint32_t new_phase, int i)
 {
   if (new_phase >= DEG180 && phase_word < DEG180) // detect falling step
   {
@@ -646,7 +658,7 @@ void BandLimitedWaveformTS::new_step_check_square (uint32_t new_phase, int i)
 // not letting a pulse glitch out of existence as these change across a single period of the waveform
 // now we detect the rising edge just like for a square wave and use that to sample the pulse width
 // parameter, which then has to be checked against the instantaneous frequency every sample.
-void BandLimitedWaveformTS::new_step_check_pulse (uint32_t new_phase, uint32_t pulse_width, int i)
+inline void BandLimitedWaveformTS::new_step_check_pulse (uint32_t new_phase, uint32_t pulse_width, int i)
 {
   if (pulse_state && phase_word < sampled_width && (new_phase >= sampled_width || new_phase < phase_word))  // falling edge
   {
@@ -680,7 +692,7 @@ void BandLimitedWaveformTS::new_step_check_pulse (uint32_t new_phase, uint32_t p
 }
 
 // new steps for sawtooth are at 180 degree point, always falling.
-void BandLimitedWaveformTS::new_step_check_saw (uint32_t new_phase, int i)
+inline void BandLimitedWaveformTS::new_step_check_saw (uint32_t new_phase, int i)
 {
   if (new_phase >= DEG180 && phase_word < DEG180) // detect falling step
   {
@@ -694,7 +706,7 @@ void BandLimitedWaveformTS::new_step_check_saw (uint32_t new_phase, int i)
 // the generation function pushd new sample into cyclic buffer, having taken out the oldest entry
 // to return.  The output is thus 16 samples behind, which allows the non-casual step function to
 // work in real time.
-int16_t BandLimitedWaveformTS::generate_sawtooth (uint32_t new_phase, int i)
+inline int16_t BandLimitedWaveformTS::generate_sawtooth (uint32_t new_phase, int i)
 {
   new_step_check_saw (new_phase, i) ;
   int32_t val = process_active_steps_saw (new_phase) ;
@@ -704,7 +716,7 @@ int16_t BandLimitedWaveformTS::generate_sawtooth (uint32_t new_phase, int i)
   return sample ;
 }
 
-int16_t BandLimitedWaveformTS::generate_square (uint32_t new_phase, int i)
+inline int16_t BandLimitedWaveformTS::generate_square (uint32_t new_phase, int i)
 {
   new_step_check_square (new_phase, i) ;
   int32_t val = process_active_steps (new_phase) ;
@@ -714,7 +726,7 @@ int16_t BandLimitedWaveformTS::generate_square (uint32_t new_phase, int i)
   return sample ;
 }
 
-int16_t BandLimitedWaveformTS::generate_pulse (uint32_t new_phase, uint32_t pulse_width, int i)
+inline int16_t BandLimitedWaveformTS::generate_pulse (uint32_t new_phase, uint32_t pulse_width, int i)
 {
   new_step_check_pulse (new_phase, pulse_width, i) ;
   int32_t val = process_active_steps_pulse (new_phase, pulse_width) ;
@@ -722,6 +734,35 @@ int16_t BandLimitedWaveformTS::generate_pulse (uint32_t new_phase, uint32_t puls
   cyclic [i&15] = val ;
   phase_word = new_phase ;
   return (int16_t) ((sample >> 1) - (sample >> 5)) ; // scale down to avoid overflow on narrow pulses, where the DC shift is big
+}
+
+void BandLimitedWaveformTS::generate_sawtooth_block (const uint32_t *phases, int16_t *out, int32_t magnitude, bool reverse)
+{
+  for (int i = 0 ; i < AUDIO_BLOCK_SAMPLES ; i++)
+  {
+    int16_t val = generate_sawtooth (phases[i], i) ;
+    val = (int16_t) ((val * magnitude) >> 16) ;
+    out[i] = reverse ? (int16_t) -val : (int16_t) +val ;
+  }
+}
+
+void BandLimitedWaveformTS::generate_square_block (const uint32_t *phases, int16_t *out, int32_t magnitude)
+{
+  for (int i = 0 ; i < AUDIO_BLOCK_SAMPLES ; i++)
+  {
+    int32_t val = generate_square (phases[i], i) ;
+    out[i] = (int16_t) ((val * magnitude) >> 16) ;
+  }
+}
+
+void BandLimitedWaveformTS::generate_pulse_block (const uint32_t *phases, const int16_t *shape, int16_t *out, int32_t magnitude)
+{
+  for (int i = 0 ; i < AUDIO_BLOCK_SAMPLES ; i++)
+  {
+    uint32_t width = ((shape[i] + 0x8000) & 0xFFFF) << 16 ;
+    int32_t val = generate_pulse (phases[i], width, i) ;
+    out[i] = (int16_t) ((val * magnitude) >> 16) ;
+  }
 }
 
 void BandLimitedWaveformTS::init_sawtooth (uint32_t freq_word)
@@ -789,12 +830,42 @@ void BandLimitedWaveformTS::init_pulse (uint32_t freq_word, uint32_t pulse_width
 
 #define TRI_MIN_WIDTH 0x00400000u        // 1/1024 of the cycle, avoids dividing by zero
 #define TRI_DRIFT_K 0.0005f              // drift correction per sample
+#define VT_DC_MAX_PERIOD 4096            // longest cycle measured for the start-up DC fix
+#define VT_DC_RAMP 64                    // samples over which that fix is applied
 #define TRI_OUT_SCALE (0.92f * 32767.0f) // a little headroom for overshoot at extreme widths
+
+inline void BandLimitedWaveformTS::vt_set_width (uint32_t w32)
+{
+  vt_w32 = w32 ;
+  vt_w = w32 * (1.0f / 4294967296.0f) ;
+  vt_inv_w = 1.0f / vt_w ;
+  vt_inv_1mw = 1.0f / (1.0f - vt_w) ;
+}
+
+// Start-up DC fix (see the sync code): measure, then remove gradually. Cheap when idle.
+inline void BandLimitedWaveformTS::vt_dc_track (float &y)
+{
+  if (vt_dc_count > 0)
+  {
+    if (vt_dc_count <= vt_dc_period)
+      vt_dc_sum += y ;
+    if (--vt_dc_count == 0)
+    {
+      vt_dc_step = vt_dc_sum / (float) vt_dc_period / VT_DC_RAMP ;
+      vt_dc_ramp = VT_DC_RAMP ;
+    }
+  }
+  else if (vt_dc_ramp > 0)
+  {
+    y -= vt_dc_step ;
+    vt_dc_ramp-- ;
+  }
+}
 
 inline float BandLimitedWaveformTS::vt_ref_at (uint32_t phase)
 {
   float ph = phase * (1.0f / 4294967296.0f) ;
-  return ph < vt_w ? 2.0f * ph / vt_w - 1.0f : 1.0f - 2.0f * (ph - vt_w) / (1.0f - vt_w) ;
+  return ph < vt_w ? 2.0f * ph * vt_inv_w - 1.0f : 1.0f - 2.0f * (ph - vt_w) * vt_inv_1mw ;
 }
 
 // New corner, dist into this sample's phase step of dphase. As insert_step: the part before
@@ -829,29 +900,32 @@ void BandLimitedWaveformTS::vt_insert (uint32_t dist, uint32_t dphase, float amp
   }
 }
 
-int16_t BandLimitedWaveformTS::vt_step (uint32_t new_phase, uint32_t pulse_width, int i)
+// Corners in this sample, in time order
+void BandLimitedWaveformTS::vt_corners (uint32_t new_phase, uint32_t pulse_width, uint32_t dphase, int i)
 {
-  const uint32_t dphase = new_phase - phase_word ;
-
-  // Corners in this sample, in time order
   if (vt_rising && phase_word < vt_w32 && (new_phase >= vt_w32 || new_phase < phase_word))
   {
-    vt_insert (vt_w32 - phase_word, dphase, -2.0f / (1.0f - vt_w) - 2.0f / vt_w, i) ;
+    vt_insert (vt_w32 - phase_word, dphase, -2.0f * (vt_inv_1mw + vt_inv_w), i) ;
     vt_rising = false ;
   }
   if (!vt_rising && new_phase < phase_word) // start of cycle
   {
-    const float fall = 2.0f / (1.0f - vt_w) ;
-    vt_w32 = pulse_width ;
-    vt_w = pulse_width * (1.0f / 4294967296.0f) ;
-    vt_insert (- phase_word, dphase, 2.0f / vt_w + fall, i) ;
+    const float fall = 2.0f * vt_inv_1mw ;
+    vt_set_width (pulse_width) ;
+    vt_insert (- phase_word, dphase, 2.0f * vt_inv_w + fall, i) ;
     vt_rising = true ;
     if (new_phase >= vt_w32) // narrow: also past the top corner
     {
-      vt_insert (vt_w32 - phase_word, dphase, -2.0f / (1.0f - vt_w) - 2.0f / vt_w, i) ;
+      vt_insert (vt_w32 - phase_word, dphase, -2.0f * (vt_inv_1mw + vt_inv_w), i) ;
       vt_rising = false ;
     }
   }
+}
+
+int16_t BandLimitedWaveformTS::vt_step (uint32_t new_phase, uint32_t pulse_width, int i)
+{
+  const uint32_t dphase = new_phase - phase_word ;
+  vt_corners (new_phase, pulse_width, dphase, i) ;
 
   // Slope for this sample
   const int f = vt_fpos & 31 ;
@@ -868,7 +942,9 @@ int16_t BandLimitedWaveformTS::vt_step (uint32_t new_phase, uint32_t pulse_width
   phase_word = new_phase ;
 
   vt_y += d * dp ;
+  // Per sample: doing this every few samples instead adds spurious tones
   vt_y += TRI_DRIFT_K * (ref - vt_y) ;
+  vt_dc_track (vt_y) ;
   if (vt_y > 1.5f) vt_y = 1.5f ;
   else if (vt_y < -1.5f) vt_y = -1.5f ;
 
@@ -887,32 +963,103 @@ int16_t BandLimitedWaveformTS::generate_triangle_variable (uint32_t new_phase, u
 
   if (vt_sync)
   {
-    // First sample after the waveform was selected: start from the real phase. Fill the
-    // delay with the plain triangle's slope, then run 32 samples up to the current one.
+    // First sample after the waveform was selected (or a silent voice resumed): start from
+    // the real phase by filling the 16 sample delay with the plain triangle's slope for
+    // the samples before this one. Their corners aren't band-limited, but this is the very
+    // start of a note. (A 32 sample pre-roll used to be run here instead; with many notes
+    // starting together that was a noticeable CPU spike.)
     vt_sync = false ;
     const uint32_t inc = vt_inc ;
-    const uint32_t start = new_phase - 32 * inc ;
-    vt_w32 = pulse_width ;
-    vt_w = pulse_width * (1.0f / 4294967296.0f) ;
+    vt_set_width (pulse_width) ;
     for (int k = 0 ; k < 32 ; k++)
       vt_future [k] = 0.0f ;
     vt_fpos = 0 ;
-    uint32_t p = start - 16 * inc ;
+    uint32_t p = new_phase - 16 * inc ;
     vt_y = vt_ref_at (p - inc) ;
     for (int k = 0 ; k < 16 ; k++, p += inc)
     {
       const int idx = (i + k) & 15 ;
-      vt_cyc [idx] = p < vt_w32 ? 2.0f / vt_w : -2.0f / (1.0f - vt_w) ;
+      vt_cyc [idx] = p < vt_w32 ? 2.0f * vt_inv_w : -2.0f * vt_inv_1mw ;
       vt_dph [idx] = inc * (1.0f / 4294967296.0f) ;
       vt_ref [idx] = vt_ref_at (p) ;
     }
-    vt_rising = start < vt_w32 ;
-    vt_level = vt_rising ? 2.0f / vt_w : -2.0f / (1.0f - vt_w) ;
-    phase_word = start - inc ;
-    for (int k = 0 ; k < 32 ; k++)
-      vt_step (start + k * inc, pulse_width, i + k) ; // i + 32 is the same slot as i
+    // Corners near the start aren't placed exactly, which leaves a small DC offset (up to a
+    // few % of full scale at high pitches) that the drift correction would take ~100ms to
+    // remove. A triangle averages zero over a cycle, so measure the mean over the first
+    // cycle (after the 16 filled samples) and remove it, spread over VT_DC_RAMP samples.
+    uint32_t period = inc > 0 ? (uint32_t) (4294967296.0f / inc) : 0 ;
+    if (period > VT_DC_MAX_PERIOD) period = VT_DC_MAX_PERIOD ;
+    vt_dc_period = period ;
+    vt_dc_count = period > 0 ? 16 + period : 0 ;
+    vt_dc_sum = 0.0f ;
+    vt_dc_ramp = 0 ;
+    phase_word = new_phase - inc ;
+    vt_rising = phase_word < vt_w32 ;
+    vt_level = vt_rising ? 2.0f * vt_inv_w : -2.0f * vt_inv_1mw ;
   }
   return vt_step (new_phase, pulse_width, i) ;
+}
+
+void BandLimitedWaveformTS::generate_triangle_variable_block (const uint32_t *phases, const int16_t *shape, int16_t *out, int32_t magnitude)
+{
+  int i = 0 ;
+  if (vt_sync) // first sample after selecting the waveform: the per-sample path sets up
+  {
+    uint32_t width = ((shape[0] + 0x8000) & 0xFFFF) << 16 ;
+    int32_t val = generate_triangle_variable (phases[0], width, 0) ;
+    out[0] = (int16_t) ((val * magnitude) >> 16) ;
+    i = 1 ;
+  }
+  // Hot state in locals; written back around the (rare) corners, which use the members
+  uint32_t pw = phase_word ;
+  float y = vt_y ;
+  float level = vt_level ;
+  int fpos = vt_fpos ;
+  for ( ; i < AUDIO_BLOCK_SAMPLES ; i++)
+  {
+    uint32_t width = ((shape[i] + 0x8000) & 0xFFFF) << 16 ;
+    if (width < TRI_MIN_WIDTH)
+      width = TRI_MIN_WIDTH ;
+    else if (width > 0xFFFFFFFFu - TRI_MIN_WIDTH)
+      width = 0xFFFFFFFFu - TRI_MIN_WIDTH ;
+    const uint32_t np = phases[i] ;
+    const uint32_t dphase = np - pw ;
+    if ((vt_rising && pw < vt_w32 && (np >= vt_w32 || np < pw)) || (!vt_rising && np < pw))
+    {
+      phase_word = pw ;
+      vt_level = level ;
+      vt_fpos = fpos ;
+      vt_corners (np, width, dphase, i) ;
+      level = vt_level ;
+    }
+
+    const int f = fpos & 31 ;
+    const float slope = level + vt_future [f] ;
+    vt_future [f] = 0.0f ;
+    fpos ++ ;
+
+    const int idx = i & 15 ;
+    const float d = vt_cyc [idx], dp = vt_dph [idx], ref = vt_ref [idx] ;
+    vt_cyc [idx] = slope ;
+    vt_dph [idx] = dphase * (1.0f / 4294967296.0f) ;
+    vt_ref [idx] = vt_ref_at (np) ;
+    pw = np ;
+
+    y += d * dp ;
+    y += TRI_DRIFT_K * (ref - y) ;
+    vt_dc_track (y) ;
+    if (y > 1.5f) y = 1.5f ;
+    else if (y < -1.5f) y = -1.5f ;
+
+    int32_t o = (int32_t) (y * TRI_OUT_SCALE) ;
+    if (o > 32767) o = 32767 ;
+    else if (o < -32768) o = -32768 ;
+    out[i] = (int16_t) ((o * magnitude) >> 16) ;
+  }
+  phase_word = pw ;
+  vt_y = y ;
+  vt_level = level ;
+  vt_fpos = fpos ;
 }
 
 void BandLimitedWaveformTS::init_triangle_variable (uint32_t freq_word)

@@ -21,6 +21,7 @@
 #define EEPROM_SEND_CC 18
 #define EEPROM_LAST_SEQUENCE 19
 #define EEPROM_SYNC_TO_MIDI_CLK 20
+#define EEPROM_SAME_VOICE_RETRIG 21
 
 FLASHMEM int8_t getFirstRun()
 {
@@ -50,6 +51,18 @@ FLASHMEM void storeSendCCToEEPROM(byte cc)
 FLASHMEM void storeSyncToMIDIClkToEEPROM(byte cc)
 {
   EEPROM.update(EEPROM_SYNC_TO_MIDI_CLK, cc);
+}
+
+// Note retrigger: 0 = Rotate (a repeated note takes the next voice), 1 = Same Voice.
+// Unset EEPROM (0xFF) reads as Rotate, the previous behaviour.
+FLASHMEM bool getSameVoiceRetrig()
+{
+  return EEPROM.read(EEPROM_SAME_VOICE_RETRIG) == 1;
+}
+
+FLASHMEM void storeSameVoiceRetrigToEEPROM(byte same)
+{
+  EEPROM.update(EEPROM_SAME_VOICE_RETRIG, same);
 }
 
 
@@ -306,6 +319,7 @@ FLASHMEM void checkFirstRun()
     storeKeyboardBasisToEEPROM(4);
     storeSendCCToEEPROM(0);
     storeSyncToMIDIClkToEEPROM(0);
+    storeSameVoiceRetrigToEEPROM(0);
     storeFirstRun();
   }
 }

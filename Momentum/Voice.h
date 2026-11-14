@@ -138,9 +138,15 @@ public:
 
         if (params.unisonMode == 1)
         {
+            // Spread the unison oscillators evenly (in cents) either side of the played
+            // pitch. DETUNE gives each oscillator's place in the spread, 0 to 1. The
+            // spread is as wide as before (detune x pitch up to the pitch), but it used to
+            // sit entirely below the pitch: the stack was flat by half the detune (about
+            // 53 cents at full detune) and voice 1 always took the full amount (TSynth issue #125).
             int offset = 2 * this->index();
-            osc.waveformMod_a.frequency(NOTEFREQS[this->_note + params.oscPitchA] * tuningCentsFrac * (params.detune + ((1 - params.detune) * DETUNE[notesOn - 1][offset])));
-            osc.waveformMod_b.frequency(NOTEFREQS[this->_note + params.oscPitchB] * tuningCentsFrac * (params.detune + ((1 - params.detune) * DETUNE[notesOn - 1][offset + 1])));
+            const float width = -log2f(params.detune); // octaves
+            osc.waveformMod_a.frequency(NOTEFREQS[this->_note + params.oscPitchA] * tuningCentsFrac * exp2f((DETUNE[notesOn - 1][offset] - 0.5f) * width));
+            osc.waveformMod_b.frequency(NOTEFREQS[this->_note + params.oscPitchB] * tuningCentsFrac * exp2f((DETUNE[notesOn - 1][offset + 1] - 0.5f) * width));
         }
         else if (params.unisonMode == 2)
         {
@@ -159,6 +165,9 @@ public:
     {
         Patch &osc = this->patch();
         bool stealing = osc.ampEnvelope_.isActive();
+        // Oscillators of a silent voice are suspended to save CPU (see service())
+        osc.waveformMod_a.resume();
+        osc.waveformMod_b.resume();
 
         // Work out the new note's settings now, glide depends on the previous note
         _pendingGain = VELOCITY[currentPatch.VelocitySensitivity][velocity] * params.mixerLevel;
@@ -197,7 +206,20 @@ public:
     // Call regularly from the main loop. Starts a deferred note-on once the old note has faded out.
     void service()
     {
-        if (!_pending || !this->patch().ampEnvelope_.isWaiting())
+        Patch &osc = this->patch();
+        // Voice finished sounding: stop its oscillators (and so its filter) until the next note
+        if (!_pending && !_voiceOn && !osc.waveformMod_a.isSuspended() && !osc.ampEnvelope_.isActive())
+        {
+            AudioNoInterrupts();
+            if (!_pending && !_voiceOn && !osc.ampEnvelope_.isActive())
+            {
+                osc.waveformMod_a.suspend();
+                osc.waveformMod_b.suspend();
+            }
+            AudioInterrupts();
+            return;
+        }
+        if (!_pending || !osc.ampEnvelope_.isWaiting())
             return;
         AudioNoInterrupts();
         _pending = false;
@@ -205,6 +227,21 @@ public:
         this->patch().filterEnvelope_.start();
         this->patch().ampEnvelope_.start();
         AudioInterrupts();
+    }
+
+    // Silence at once and stop the oscillators (CPU overload). Returns true if it was held.
+    bool forceSilence()
+    {
+        Patch &osc = this->patch();
+        bool wasOn = _voiceOn;
+        _pending = false;
+        _voiceOn = false;
+        _noteId = 0;
+        osc.filterEnvelope_.close();
+        osc.ampEnvelope_.close();
+        osc.waveformMod_a.suspend();
+        osc.waveformMod_b.suspend();
+        return wasOn;
     }
 
     void noteOff()

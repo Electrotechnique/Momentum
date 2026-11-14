@@ -221,6 +221,9 @@ void AudioFilterStateVariableTS::update_variable(const int16_t *in,
 // worked out per sample from the control input like the Chamberlin version.
 
 #define TPT_MAX_FC (0.45f * AUDIO_SAMPLE_RATE_EXACT) // ~19.9kHz
+#ifndef TPT_COEF_INTERVAL
+#define TPT_COEF_INTERVAL 4 // samples between cutoff coefficient updates (must divide 128)
+#endif
 #define TPT_MIN_FC 1.0f
 
 // 2^x, about 0.25 cent accurate, for |x| < 30
@@ -246,8 +249,13 @@ static inline void tpt_tan(float x, float &n, float &d)
 }
 
 void AudioFilterStateVariableTS::update_tpt(const int16_t *in, const int16_t *ctl,
-	int16_t *lp, int16_t *bp, int16_t *hp)
+	int16_t *lp, int16_t *bp, int16_t *hp, int16_t *mixout)
 {
+	// Mix gains (mix mode), ramped over the block
+	const float d_ml = (mix_lp - mix_lp_now) * (1.0f / AUDIO_BLOCK_SAMPLES);
+	const float d_mb = (mix_bp - mix_bp_now) * (1.0f / AUDIO_BLOCK_SAMPLES);
+	const float d_mh = (mix_hp - mix_hp_now) * (1.0f / AUDIO_BLOCK_SAMPLES);
+	float ml = mix_lp_now, mb = mix_bp_now, mh = mix_hp_now;
 	// Ramp parameter changes over the block instead of stepping (cutoff in octaves)
 	const float log2fc_end = tpt_log2fc, k_end = tpt_k, gain_end = tpt_gain, oct_end = tpt_oct;
 	if (!tpt_started) {
@@ -263,27 +271,55 @@ void AudioFilterStateVariableTS::update_tpt(const int16_t *in, const int16_t *ct
 	float s1 = tpt_s1, s2 = tpt_s2;
 	const float wscale = 3.14159265f / AUDIO_SAMPLE_RATE_EXACT;
 
-	for (int i = 0; i < AUDIO_BLOCK_SAMPLES; i++) {
-		log2fc += d_log2fc; k += d_k; gain += d_gain; oct += d_oct;
-		float lf = log2fc;
-		if (ctl) lf += ctl[i] * (1.0f / 32768.0f) * oct;
+	// The cutoff coefficients (2^x, tan and a division) are worked out every
+	// TPT_COEF_INTERVAL samples, at the last sample of each group, and interpolated in
+	// between. The control input moves far slower than that, and this was most of the
+	// filter's cost.
+	auto coefficients = [&](int i, float lfc, float kk, float oc, float &g_out, float &hc_out) {
+		float lf = lfc;
+		if (ctl) lf += ctl[i] * (1.0f / 32768.0f) * oc;
 		float fc = tpt_exp2(lf);
 		if (fc > TPT_MAX_FC) fc = TPT_MAX_FC;
 		else if (fc < TPT_MIN_FC) fc = TPT_MIN_FC;
 		// g = n/d and 1/(1 + g(g + k)) = d^2/q with q = d^2 + n(n + k d): one division gives both
 		float n, d;
 		tpt_tan(fc * wscale, n, d);
-		const float q = d * d + n * (n + k * d);
+		const float q = d * d + n * (n + kk * d);
 		const float inv = 1.0f / (d * q);
-		const float g = n * q * inv;
+		g_out = n * q * inv;
+		hc_out = d * d * d * inv;
+	};
+	if (tpt_hc == 0.0f) // first block: start from the current values
+		coefficients(0, log2fc, k, oct, tpt_g, tpt_hc);
+	float g = tpt_g, hc = tpt_hc, dg = 0, dhc = 0;
+
+	for (int i = 0; i < AUDIO_BLOCK_SAMPLES; i++) {
+		if ((i % TPT_COEF_INTERVAL) == 0) {
+			const int last = i + TPT_COEF_INTERVAL - 1;
+			const float n_steps = (float)(last + 1);
+			float g_end, hc_end;
+			coefficients(last, tpt_log2fc_now + d_log2fc * n_steps, tpt_k_now + d_k * n_steps,
+				tpt_oct_now + d_oct * n_steps, g_end, hc_end);
+			dg = (g_end - g) * (1.0f / TPT_COEF_INTERVAL);
+			dhc = (hc_end - hc) * (1.0f / TPT_COEF_INTERVAL);
+		}
+		log2fc += d_log2fc; k += d_k; gain += d_gain; oct += d_oct;
+		g += dg; hc += dhc;
 		const float x = in[i] * gain;
-		const float h = (x - (k + g) * s1 - s2) * (d * d * d * inv);
+		const float h = (x - (k + g) * s1 - s2) * hc;
 		const float v1 = g * h;
 		const float b = v1 + s1;
 		s1 = b + v1;
 		const float v2 = g * b;
 		const float l = v2 + s2;
 		s2 = l + v2;
+		if (mixout) {
+			// Bandpass times k (= 1/Q): unity gain at the cutoff, like the other two
+			ml += d_ml; mb += d_mb; mh += d_mh;
+			const int32_t m = (int32_t)(ml * l + mb * k * b + mh * h);
+			mixout[i] = soft_clip ? softLimit16(m) : hardLimit16(m);
+			continue;
+		}
 		if (soft_clip) {
 			lp[i] = softLimit16((int32_t)l);
 			bp[i] = softLimit16((int32_t)b);
@@ -298,61 +334,74 @@ void AudioFilterStateVariableTS::update_tpt(const int16_t *in, const int16_t *ct
 	if (!(s1 < 1e7f && s1 > -1e7f)) s1 = 0;
 	if (!(s2 < 1e7f && s2 > -1e7f)) s2 = 0;
 	tpt_s1 = s1; tpt_s2 = s2;
+	tpt_g = g; tpt_hc = hc;
+	mix_lp_now = mix_lp; mix_bp_now = mix_bp; mix_hp_now = mix_hp;
 	tpt_log2fc_now = log2fc_end; tpt_k_now = k_end; tpt_gain_now = gain_end; tpt_oct_now = oct_end;
+}
+
+// Mix mode for the original (Chamberlin) core: mix its three outputs here
+void AudioFilterStateVariableTS::mix_fixed_point(const int16_t *lp, const int16_t *bp, const int16_t *hp, int16_t *out)
+{
+	const float k = setting_damp * (1.0f / 1073741824.0f); // 1/Q
+	const float d_ml = (mix_lp - mix_lp_now) * (1.0f / AUDIO_BLOCK_SAMPLES);
+	const float d_mb = (mix_bp - mix_bp_now) * (1.0f / AUDIO_BLOCK_SAMPLES);
+	const float d_mh = (mix_hp - mix_hp_now) * (1.0f / AUDIO_BLOCK_SAMPLES);
+	float ml = mix_lp_now, mb = mix_bp_now, mh = mix_hp_now;
+	for (int i = 0; i < AUDIO_BLOCK_SAMPLES; i++) {
+		ml += d_ml; mb += d_mb; mh += d_mh;
+		const int32_t m = (int32_t)(ml * lp[i] + mb * k * bp[i] + mh * hp[i]);
+		out[i] = soft_clip ? softLimit16(m) : hardLimit16(m);
+	}
+	mix_lp_now = mix_lp; mix_bp_now = mix_bp; mix_hp_now = mix_hp;
 }
 
 void AudioFilterStateVariableTS::update(void)
 {
-	audio_block_t *input_block=NULL, *control_block=NULL;
-	audio_block_t *lowpass_block=NULL, *bandpass_block=NULL, *highpass_block=NULL;
-
-	input_block = receiveReadOnly(0);
-	control_block = receiveReadOnly(1);
+	audio_block_t *input_block = receiveReadOnly(0);
+	audio_block_t *control_block = receiveReadOnly(1);
 	if (!input_block) {
 		if (control_block) release(control_block);
 		return;
 	}
-	lowpass_block = allocate();
-	if (!lowpass_block) {
+	const int16_t *ctl = control_block ? control_block->data : NULL;
+
+	if (mix_mode) {
+		audio_block_t *out = allocate();
+		if (out) {
+#if FILTER_TPT
+			update_tpt(input_block->data, ctl, NULL, NULL, NULL, out->data);
+#else
+			int16_t lp[AUDIO_BLOCK_SAMPLES], bp[AUDIO_BLOCK_SAMPLES], hp[AUDIO_BLOCK_SAMPLES];
+			if (ctl) update_variable(input_block->data, ctl, lp, bp, hp);
+			else update_fixed(input_block->data, lp, bp, hp);
+			mix_fixed_point(lp, bp, hp, out->data);
+#endif
+			transmit(out, 0);
+			release(out);
+		}
 		release(input_block);
-		if (control_block) release(control_block);
-		return;
-	}
-	bandpass_block = allocate();
-	if (!bandpass_block) {
-		release(input_block);
-		release(lowpass_block);
-		if (control_block) release(control_block);
-		return;
-	}
-	highpass_block = allocate();
-	if (!highpass_block) {
-		release(input_block);
-		release(lowpass_block);
-		release(bandpass_block);
 		if (control_block) release(control_block);
 		return;
 	}
 
-#if FILTER_TPT
-	update_tpt(input_block->data, control_block ? control_block->data : NULL,
-		 lowpass_block->data, bandpass_block->data, highpass_block->data);
-	if (control_block) release(control_block);
-#else
-	if (control_block) {
-		update_variable(input_block->data,
-			 control_block->data,
-			 lowpass_block->data,
-			 bandpass_block->data,
-			 highpass_block->data);
-		release(control_block);
-	} else {
-		update_fixed(input_block->data,
-			 lowpass_block->data,
-			 bandpass_block->data,
-			 highpass_block->data);
+	audio_block_t *lowpass_block = allocate();
+	audio_block_t *bandpass_block = allocate();
+	audio_block_t *highpass_block = allocate();
+	if (!lowpass_block || !bandpass_block || !highpass_block) {
+		if (lowpass_block) release(lowpass_block);
+		if (bandpass_block) release(bandpass_block);
+		if (highpass_block) release(highpass_block);
+		release(input_block);
+		if (control_block) release(control_block);
+		return;
 	}
+#if FILTER_TPT
+	update_tpt(input_block->data, ctl, lowpass_block->data, bandpass_block->data, highpass_block->data, NULL);
+#else
+	if (ctl) update_variable(input_block->data, ctl, lowpass_block->data, bandpass_block->data, highpass_block->data);
+	else update_fixed(input_block->data, lowpass_block->data, bandpass_block->data, highpass_block->data);
 #endif
+	if (control_block) release(control_block);
 	release(input_block);
 	transmit(lowpass_block, 0);
 	release(lowpass_block);
@@ -360,7 +409,6 @@ void AudioFilterStateVariableTS::update(void)
 	release(bandpass_block);
 	transmit(highpass_block, 2);
 	release(highpass_block);
-	return;
 }
 
 #elif defined(KINETISL)

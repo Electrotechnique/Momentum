@@ -15,11 +15,11 @@ https://forum.pjrc.com/threads/66840-Roadmap-quot-Dynamic-Updates-quot-any-effor
 class Mixer
 {
 private:
-    AudioMixer4 &mixer;
+    AudioMixer4TS &mixer;
     uint8_t index;
 
 public:
-    Mixer(AudioMixer4 &mixer_, uint8_t index_) : mixer(mixer_), index(index_) {}
+    Mixer(AudioMixer4TS &mixer_, uint8_t index_) : mixer(mixer_), index(index_) {}
 
     void gain(float value)
     {
@@ -31,22 +31,22 @@ struct PatchShared
 {
     AudioSynthWaveformDcTS pitchBend;
     AudioSynthWaveformTS pitchLfo;
-    AudioMixer4 pitchMixer;
+    AudioMixer4TS pitchMixer;
     AudioSynthWaveformTS pwmLfoA;
     AudioSynthWaveformTS pwmLfoB;
     AudioSynthWaveformTS filterLfo;
     AudioSynthWaveformDcTS pwa;
     AudioSynthWaveformDcTS pwb;
-    AudioMixer4 noiseMixer;
+    AudioMixer4TS noiseMixer;
 
-    AudioMixer4 voiceMixer[3];
-    AudioMixer4 voiceMixerM;
+    AudioMixer4TS voiceMixer[3];
+    AudioMixer4TS voiceMixerM;
 
     AudioEffectEnsemble ensemble;
     AudioFilterDCBlock dcOffsetFilter;
-    AudioMixer4 volumeMixer;
-    AudioMixer4 ensembleEffectMixerL;
-    AudioMixer4 ensembleEffectMixerR;
+    AudioMixer4TS volumeMixer;
+    AudioMixer4TS ensembleEffectMixerL;
+    AudioMixer4TS ensembleEffectMixerR;
     // The reverb is shared by all timbres and follows the ensemble (see Global).
     // Set by Global; one instance because each needs ~120KB of RAM2.
     AudioEffectPlateReverb *reverb = nullptr;
@@ -81,7 +81,7 @@ public:
         whiteNoiseConnection = new AudioConnection(white, 0, noiseMixer, 1);
     }
 
-    void connectOutput(AudioMixer4 &left, AudioMixer4 &right, uint8_t index)
+    void connectOutput(AudioMixer4TS &left, AudioMixer4TS &right, uint8_t index)
     {
         delete outputLConnection;
         delete outputRConnection;
@@ -95,32 +95,32 @@ struct Patch
 {
     AudioEffectEnvelopeTS filterEnvelope_;
 
-    AudioMixer4 pwMixer_a;
-    AudioMixer4 pwMixer_b;
+    AudioMixer4TS pwMixer_a;
+    AudioMixer4TS pwMixer_b;
 
     AudioSynthWaveformDcTS glide_;
 
     AudioSynthWaveformDcTS filterVelocity_;
 
-    AudioMixer4 oscModMixer_a;
-    AudioMixer4 oscModMixer_b;
+    AudioMixer4TS oscModMixer_a;
+    AudioMixer4TS oscModMixer_b;
 
     AudioSynthWaveformModulatedTS waveformMod_a;
     AudioSynthWaveformModulatedTS waveformMod_b;
 
     AudioEffectDigitalCombine oscFX_;
 
-    AudioMixer4 waveformMixer_;
+    AudioMixer4TS waveformMixer_;
 
-    AudioMixer4 filterModMixer_;
+    AudioMixer4TS filterModMixer_;
 
     AudioFilterStateVariableTS filter_;
 
-    AudioMixer4 filterMixer_;
+    // The LP/BP/HP mix is done inside filter_ (see AudioFilterStateVariableTS::mix)
 
     AudioEffectEnvelopeTS ampEnvelope_;
 
-    AudioConnection connections[25] = {
+    AudioConnection connections[22] = {
         {filterVelocity_, 0, filterModMixer_, 3},
         {pwMixer_a, 0, waveformMod_a, 1},
         {pwMixer_b, 0, waveformMod_b, 1},
@@ -134,10 +134,7 @@ struct Patch
         {oscFX_, 0, waveformMixer_, 3},
         {waveformMixer_, 0, filter_, 0},
         {filterModMixer_, 0, filter_, 1},
-        {filter_, 0, filterMixer_, 0},
-        {filter_, 1, filterMixer_, 1},
-        {filter_, 2, filterMixer_, 2},
-        {filterMixer_, ampEnvelope_},
+        {filter_, 0, ampEnvelope_, 0},
         // Mod sources
         {oscModMixer_a, 0, waveformMod_a, 0},
         {oscModMixer_b, 0, waveformMod_b, 0},
@@ -197,7 +194,10 @@ public:
 struct Global
 {
 private:
-    static const uint8_t MAX_NO_TIMBER = 2;
+    // Only one voice group (12 voices) is created, using SharedAudio[0]. A second set of shared
+    // objects (LFOs, mixers, ensemble, DC filter...) used to be built and ran every block
+    // producing silence. Raise again for multi-timbrality.
+    static const uint8_t MAX_NO_TIMBER = 1;
     static const uint8_t MAX_NO_VOICE = 12;
 
 public:
@@ -207,17 +207,18 @@ public:
     AudioSynthNoiseWhite white;
     AudioAnalyzePeak peak;
     Oscilloscope scope;
-    AudioMixer4 ensembleEffectMixerR[3];
-    AudioMixer4 effectMixerRM;
-    AudioMixer4 ensembleEffectMixerL[3];
-    AudioMixer4 effectMixerLM;
+    AudioCpuGuard cpuGuard; // Drops a voice if the audio processing overruns, rather than hang
+    AudioMixer4TS ensembleEffectMixerR[3];
+    AudioMixer4TS effectMixerRM;
+    AudioMixer4TS ensembleEffectMixerL[3];
+    AudioMixer4TS effectMixerLM;
     AudioEffectPlateReverb reverb; // Stereo, in series after the ensemble
     AudioOutputI2S i2s;
 
     PatchShared SharedAudio[MAX_NO_TIMBER];
     Patch Oscillators[MAX_NO_VOICE];
 
-    AudioConnection connectionsArray[14] = {
+    AudioConnection connectionsArray[15] = {
         {ensembleEffectMixerL[0], 0, effectMixerLM, 0},
         {ensembleEffectMixerL[1], 0, effectMixerLM, 1},
         {ensembleEffectMixerL[2], 0, effectMixerLM, 2},
@@ -231,6 +232,7 @@ public:
         {reverb, 1, i2s, 1},
         {reverb, 0, i2s, 0},
         {reverb, 0, usbAudio, 0},
+        {reverb, 0, cpuGuard, 0}, // Only so it runs every update
         // Scope taps the voices before the effects (DC removed, before volume) for a clean trace
         {SharedAudio[0].dcOffsetFilter, 0, scope, 0}};
 

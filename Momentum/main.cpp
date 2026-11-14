@@ -60,6 +60,9 @@
 #include <USBHost_t36.h>
 #include <TeensyThreads.h>
 #include "ThreadSafety.h"
+
+// Momentum's audio code works with blocks of any multiple of 16 samples (64 or 128)
+static_assert(AUDIO_BLOCK_SAMPLES % 16 == 0 && AUDIO_BLOCK_SAMPLES >= 32, "AUDIO_BLOCK_SAMPLES must be a multiple of 16");
 #include <TeensyTimerTool.h>
 using namespace TeensyTimerTool;
 #include "MidiCC.h"
@@ -154,6 +157,8 @@ uint32_t previousMillis = millis(); // For MIDI Clk Sync
 uint32_t timeNow = millis();        // For MIDI Clk Sync
 
 uint8_t midiClkCount = 0;    // For MIDI Clk Sync
+uint32_t midiBeatCount = 0;      // MIDI clock beats since Start
+uint32_t midiLastBeatMicros = 0; // time of the last beat
 uint8_t midiClkArpCount = 0; // For MIDI Clk Sync with Arp
 int voiceToReturn = -1;      // Initialise
 
@@ -315,6 +320,11 @@ FLASHMEM void setup()
     keyboardOct = getKeyboardBasis();
     sendCC = getSendCC();
     syncToMIDIClk = getSyncToMIDIClk();
+    // Read note retrigger mode from EEPROM
+    groupvec[activeGroupIndex]->setSameVoiceRetrig(getSameVoiceRetrig());
+    // If the audio processing ever overruns, drop a voice rather than hang
+    global.cpuGuard.onOverload = []()
+    { groupvec[activeGroupIndex]->shedVoice(); };
 
     assignStrings();
     assignParametersForPerformanceEncoders();
@@ -832,27 +842,7 @@ FLASHMEM void myControlChange(byte channel, byte control, byte value)
         currentPatch.FilterMixer = value;
         groupvec[activeGroupIndex]->setFilterMixer(LINEAR_FILTERMIXER[value]);
 
-        String filterStr;
-        if (LINEAR_FILTERMIXER[value] == BANDPASS)
-        {
-            filterStr = F("Band Pass");
-        }
-        else
-        {
-            // LP-HP mix mode - a notch filter
-            if (LINEAR_FILTERMIXER[value] == LOWPASS)
-            {
-                filterStr = F("Low Pass");
-            }
-            else if (LINEAR_FILTERMIXER[value] == HIGHPASS)
-            {
-                filterStr = F("High Pass");
-            }
-            else
-            {
-                filterStr = F("Low ") + String(100 - int(100 * LINEAR_FILTERMIXER[value])) + F(" - ") + String(int(100 * LINEAR_FILTERMIXER[value])) + F(" High");
-            }
-        }
+        String filterStr = filterMixerStr(LINEAR_FILTERMIXER[value]);
         if (!setEncValue(CCfiltermixer, value, filterStr))
             showCurrentParameterOverlay(ParameterStrMap[CCfiltermixer], filterStr);
 
@@ -1333,6 +1323,8 @@ FLASHMEM void myMIDIClockStart()
     if (midiDiscard)
         return; // Panic is flushing the MIDI inputs
     midiClkCount = 0;
+    midiBeatCount = 0;
+    midiLastBeatMicros = micros();
     sinceMidiClock = 0;
     // Only follow the clock when "sync to MIDI clock" is on: the arp used to switch to it
     // regardless, and was then left with no timer at all after a MIDI Stop
@@ -1404,16 +1396,22 @@ void myMIDIClock()
             midiClkArpCount = 0;
     }
 
-    // This recalculates the LFO frequencies if the tempo changes (MIDI cLock is 24ppq)
-    // At 120bpm, a quarter note is every 500ms, 24ppq may have an error of 20ms giving an error in calculated bpm of up to 5bpm
+    // Every beat (24 clocks): the tempo is measured in microseconds (was milliseconds) and
+    // synced LFOs are kept in phase with the beat count since Start (they used to only get
+    // the rate, so they kept an arbitrary offset and drifted against the music)
     if (++midiClkCount > 23)
     {
         // TODO: Multitimbral Most of this needs to move into the VoiceGroup
-        timeNow = millis();
-        lfoSyncFreq = 1000.0f / (timeNow - previousMillis);
-        previousMillis = timeNow;
-        groupvec[activeGroupIndex]->filterMidiClock(lfoSyncFreq * lfoFilterTempoValue);
-        groupvec[activeGroupIndex]->pitchMidiClock(lfoSyncFreq * lfoPitchTempoValue);
+        const uint32_t now = micros();
+        const uint32_t beatMicros = now - midiLastBeatMicros;
+        const bool haveTempo = midiLastBeatMicros != 0 && beatMicros > 0 && beatMicros < 4000000; // 15bpm and up
+        midiLastBeatMicros = now;
+        midiBeatCount++;
+        if (haveTempo)
+        {
+            lfoSyncFreq = 1000000.0f / beatMicros;
+            groupvec[activeGroupIndex]->midiClockBeat(midiBeatCount, beatMicros * 0.000001f);
+        }
         midiClkCount = 0;
     }
 }
@@ -3250,6 +3248,28 @@ FLASHMEM void sequencerLEDs()
     }
 }
 
+// Audio CPU use by group of audio objects: current / max over the last second, in % of the
+// time available
+struct CpuGroup
+{
+    float now = 0, max = 0;
+    void add(AudioStream &s)
+    {
+        now += s.processorUsage();
+        max += s.processorUsageMax();
+        s.processorUsageMaxReset();
+    }
+    void print(const __FlashStringHelper *name)
+    {
+        Serial.print(F("  "));
+        Serial.print(name);
+        Serial.print(F(" "));
+        Serial.print(now, 1);
+        Serial.print(F("/"));
+        Serial.print(max, 1);
+    }
+};
+
 FLASHMEM void CPUMonitor()
 {
     // Once a second: printing every loop floods USB serial and can stall the main loop
@@ -3257,10 +3277,80 @@ FLASHMEM void CPUMonitor()
     if (sincePrint < 1000)
         return;
     sincePrint = 0;
-    // Memory is in audio blocks (an integer), out of the AudioMemory() allocation in setup().
+
+    CpuGroup cg_osc, cg_filt, cg_env, cg_vmix, cg_oscfx, cg_dc, cg_lfo, cg_smix, cg_ens, cg_dcf, cg_rev, cg_noise, cg_out;
+    for (uint8_t i = 0; i < global.maxVoices(); i++)
+    {
+        Patch &p = global.Oscillators[i];
+        cg_osc.add(p.waveformMod_a);
+        cg_osc.add(p.waveformMod_b);
+        cg_filt.add(p.filter_);
+        cg_env.add(p.ampEnvelope_);
+        cg_env.add(p.filterEnvelope_);
+        cg_vmix.add(p.pwMixer_a);
+        cg_vmix.add(p.pwMixer_b);
+        cg_vmix.add(p.oscModMixer_a);
+        cg_vmix.add(p.oscModMixer_b);
+        cg_vmix.add(p.waveformMixer_);
+        cg_vmix.add(p.filterModMixer_);
+        cg_oscfx.add(p.oscFX_);
+        cg_dc.add(p.glide_);
+        cg_dc.add(p.filterVelocity_);
+    }
+    PatchShared &s = global.SharedAudio[0];
+    cg_lfo.add(s.pitchLfo);
+    cg_lfo.add(s.pwmLfoA);
+    cg_lfo.add(s.pwmLfoB);
+    cg_lfo.add(s.filterLfo);
+    cg_lfo.add(s.pitchBend);
+    cg_lfo.add(s.pwa);
+    cg_lfo.add(s.pwb);
+    cg_smix.add(s.pitchMixer);
+    cg_smix.add(s.noiseMixer);
+    for (uint8_t i = 0; i < 3; i++)
+        cg_smix.add(s.voiceMixer[i]);
+    cg_smix.add(s.voiceMixerM);
+    cg_smix.add(s.volumeMixer);
+    cg_smix.add(s.ensembleEffectMixerL);
+    cg_smix.add(s.ensembleEffectMixerR);
+    cg_ens.add(s.ensemble);
+    cg_dcf.add(s.dcOffsetFilter);
+    cg_rev.add(global.reverb);
+    cg_noise.add(global.pink);
+    cg_noise.add(global.white);
+    cg_out.add(global.i2s);
+    cg_out.add(global.usbAudio);
+    cg_out.add(global.peak);
+    cg_out.add(global.scope);
+    cg_out.add(global.cpuGuard);
+    cg_out.add(global.constant1Dc);
+    for (uint8_t i = 0; i < 3; i++)
+    {
+        cg_out.add(global.ensembleEffectMixerL[i]);
+        cg_out.add(global.ensembleEffectMixerR[i]);
+    }
+    cg_out.add(global.effectMixerLM);
+    cg_out.add(global.effectMixerRM);
+
+    // Memory is in audio blocks, out of the AudioMemory() allocation in setup().
     // Stack is the most the display thread has used, out of DISPLAY_THREAD_STACK.
-    Serial.printf(" CPU:%.1f (%.1f)  MEM:%u (%u)  Display stack:%u/%u\n", AudioProcessorUsage(), AudioProcessorUsageMax(),
+    Serial.printf("CPU %.1f/%.1f%%  MEM %u/%u  Display stack %u/%u |", AudioProcessorUsage(), AudioProcessorUsageMax(),
                   (unsigned)AudioMemoryUsage(), (unsigned)AudioMemoryUsageMax(), (unsigned)displayStackUsed(), (unsigned)DISPLAY_THREAD_STACK);
+    cg_osc.print(F("osc"));
+    cg_filt.print(F("filter"));
+    cg_env.print(F("env"));
+    cg_vmix.print(F("vmix"));
+    cg_oscfx.print(F("oscfx"));
+    cg_dc.print(F("dc"));
+    cg_lfo.print(F("lfo"));
+    cg_smix.print(F("smix"));
+    cg_ens.print(F("ensemble"));
+    cg_dcf.print(F("dcfilt"));
+    cg_rev.print(F("reverb"));
+    cg_noise.print(F("noise"));
+    cg_out.print(F("out"));
+    Serial.println();
+    AudioProcessorUsageMaxReset();
 }
 
 // Prints the details of the last crash (if any) once the Serial Monitor is connected
@@ -3303,13 +3393,20 @@ void loop()
                 MIDIClkSignal = false;
         }
         crashReportCheck();
-        // Uncomment for CPU, audio memory and display stack figures (printed once a second)
+        // Uncomment for CPU (total and by group), audio memory and display stack, once a second
         // CPUMonitor();
         loopCount = 0;
     }
     encoders.read();
     buttons.read();
-    // Start note-ons that were waiting for a stolen voice to fade out
+    // Start note-ons that were waiting for a stolen voice to fade out, and suspend the
+    // oscillators of voices that have stopped sounding
     groupvec[activeGroupIndex]->serviceVoices();
     checkPendingPatchRecall();
+    static uint32_t overloadsReported = 0;
+    if (global.cpuGuard.overloads != overloadsReported)
+    {
+        overloadsReported = global.cpuGuard.overloads;
+        Serial.println(F("Audio CPU overload: a voice was dropped"));
+    }
 }
