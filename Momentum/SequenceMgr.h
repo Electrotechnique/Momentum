@@ -422,14 +422,15 @@ typedef struct SequenceStruct
     boolean running = false;
     boolean recording = false;
 
-    uint8_t note_in;
-    uint8_t note_in_velocity;
-    int8_t transpose;
+    uint8_t note_in = 0;
+    uint8_t note_in_velocity = 0;
 
     uint32_t tempo_us = 125'000; // 60s/bpm
 
-    uint8_t prev_note; // note_offs for every instrument track
-    uint8_t prev_vel;
+    // Initialised: a SequenceStruct made on the stack (missing sequence) had garbage here,
+    // so a note-off was sent for a random note
+    uint8_t prev_note = 0; // note_offs for every instrument track
+    uint8_t prev_vel = 0;
 } SequenceStruct;
 
 uint8_t currentSequenceIndex = 0;
@@ -749,16 +750,9 @@ void noteOnRoutine()
         // past it, or notes are read (and recorded) outside the pattern
         if (currentSequence.step >= currentSequence.length)
             currentSequence.step = 0;
-        if (currentSequence.note_in > 0 && currentSequence.note_in < 62 && currentSequence.recording == false)
-        {
-            myNoteOff(midiChannel, currentSequence.Notes[currentSequence.step] + currentSequence.transpose, 0);
-            myNoteOff(midiChannel, currentSequence.Notes[currentSequence.step > 0 ? currentSequence.step - 1 : currentSequence.length - 1] + currentSequence.transpose, 0);
-            if (currentSequence.note_in > 65)
-                currentSequence.note_in = currentSequence.note_in - 12;
-            currentSequence.transpose = currentSequence.note_in % 12;
-            currentSequence.transpose = currentSequence.transpose - 12;
+        // A note played just before recording was turned off isn't recorded later
+        if (!currentSequence.recording)
             currentSequence.note_in = 0;
-        }
 
         seq_live_recording();
 
@@ -804,6 +798,9 @@ void noteOffRoutine()
                 {
                     myNoteOff(midiChannel, currentSequence.prev_note, 0);
                     currentSequence.noteoffsent = true;
+                    // Sent once: repeating it on every empty step cut off the same note
+                    // played live on the keyboard
+                    currentSequence.prev_note = 0;
                 }
             }
         }

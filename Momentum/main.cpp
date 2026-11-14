@@ -341,6 +341,14 @@ void myNoteOn(byte channel, byte note, byte velocity)
 {
     if (midiDiscard)
         return; // Panic is flushing the MIDI inputs
+    // Seed random() (Random arp style) from the CPU cycle count at the first key press, so
+    // it doesn't play the same sequence after every power-up
+    static bool randomSeeded = false;
+    if (!randomSeeded)
+    {
+        randomSeed(ARM_DWT_CYCCNT | 1);
+        randomSeeded = true;
+    }
     if (arpRunning)
     {
         // If it's in hold mode and you are not holding any notes down,
@@ -366,9 +374,6 @@ void myNoteOn(byte channel, byte note, byte velocity)
         }
         else
             return;
-
-        if (seqMidiSync && arpNotesHeld == 0)
-            midiClkArpCount = 0;
 
         // find the right place to insert the note in the notes array
         if (arpStyle == PLAYORDER)
@@ -458,8 +463,11 @@ void myNoteOff(byte channel, byte note, byte velocity)
         // arpeggio, so it removed the wrong note in Play Order)
         if (!arpHold)
             removeArpNote(note);
+        // The arp plays its own notes: this key never sounded, and a note-off here cut
+        // off an arp note of the same pitch
+        return;
     }
-    noteOff(channel, note, velocity);
+    noteOff(channel, note, velocity); // Includes keys held before the arp started
 }
 
 FLASHMEM void updatePatchnameAndIndex(String name, uint32_t index, uint32_t UID)
