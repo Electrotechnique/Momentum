@@ -74,6 +74,9 @@ volatile boolean sdCardInterrupt = false;
 boolean usbHostPluggedIn = false;
 elapsedMillis usb_host_wait_timer;
 boolean MIDIClkSignal = false;
+// MIDI clock counts as lost after this long without a tick (24ppq at 20bpm is 125ms per tick)
+#define MIDI_CLOCK_TIMEOUT_MS 500
+elapsedMillis sinceMidiClock;
 
 State state = State::MAIN;
 boolean keyboardActive = false;
@@ -354,8 +357,13 @@ void myNoteOn(byte channel, byte note, byte velocity)
             //     sequencerStart();
             // }
         }
+        if (isArpKeyHeld(note))
+            return; // Duplicate note-on (e.g. two merged MIDI sources)
         if (arpNotesHeld < sizeof(arpNotes) - 1)
+        {
             arpNotesHeld++;
+            setArpKeyHeld(note, true);
+        }
         else
             return;
 
@@ -440,26 +448,16 @@ void myNoteOff(byte channel, byte note, byte velocity)
 {
     if (midiDiscard)
         return; // Panic is flushing the MIDI inputs
-    if (arpRunning)
+    // Only keys the arp counted: not ones held before it started or rejected when it was full
+    if (arpRunning && isArpKeyHeld(note))
     {
+        setArpKeyHeld(note, false);
         if (arpNotesHeld > 0)
             arpNotesHeld--;
-
-        arpNotes[sizeof(arpNotes) - 1] = '\0';
-        for (uint8_t i = 0; i < sizeof(arpNotes) - 1; i++)
-        {
-            // note released
-            if (!arpHold && arpNotes[i] >= note)
-            {
-                // shift all notes in the array beyond or equal to the
-                // note in question, thereby removing it and keeping
-                // the array compact.
-                arpNotes[i] = arpNotes[i + 1];
-                arpVels[i] = arpVels[i + 1];
-            }
-        }
-        // if (arpNotesHeld == 0 && getNotesInArp() == 0)
-        //     sequencerStop();
+        // Remove exactly the released note (the old shift-based removal assumed a sorted
+        // arpeggio, so it removed the wrong note in Play Order)
+        if (!arpHold)
+            removeArpNote(note);
     }
     noteOff(channel, note, velocity);
 }
@@ -1318,15 +1316,44 @@ FLASHMEM void sequencerStop()
     currentSequence.note_in = 0;
 }
 
+// The arp carries on with its own timer when MIDI clock stops or is lost
+FLASHMEM void arpToInternalClock()
+{
+    if (arpRunning && !seqMidiSync)
+    {
+        midiClkArpCount = 0;
+        sequencerStart(); // Starts the internal timer, as seqMidiSync is false
+    }
+}
+
+// MIDI Stop, or the clock was lost (see loop()). seqMidiSync is only ever set while
+// "sync to MIDI clock" is on, and is cleared here so the internal clock works again.
+FLASHMEM void midiClockStopped()
+{
+    bool wasSynced = seqMidiSync;
+    if (seqMidiSync)
+    {
+        sequencerStop();
+        groupvec[activeGroupIndex]->allNotesOff();
+        resetNotes();
+    }
+    seqMidiSync = false;
+    MIDIClkSignal = false;
+    if (wasSynced)
+        arpToInternalClock();
+}
+
 FLASHMEM void myMIDIClockContinue()
 {
     if (midiDiscard)
         return; // Panic is flushing the MIDI inputs
+    sinceMidiClock = 0;
+    if (!syncToMIDIClk)
+        return;
     if (!currentSequence.running)
     {
         seqMidiSync = true;
-        if (syncToMIDIClk)
-            sequencerStart(true);
+        sequencerStart(true);
     }
 }
 
@@ -1334,16 +1361,22 @@ FLASHMEM void myMIDIClockStart()
 {
     if (midiDiscard)
         return; // Panic is flushing the MIDI inputs
-    if ((!currentSequence.running && !seqMidiSync) || arpRunning)
-        seqMidiSync = true;
     midiClkCount = 0;
-    if ((state == State::SEQUENCEPAGE || state == State::SEQUENCEEDIT) && seqMidiSync && syncToMIDIClk)
-        sequencerStart();
-    else if (arpRunning)
+    sinceMidiClock = 0;
+    // Only follow the clock when "sync to MIDI clock" is on: the arp used to switch to it
+    // regardless, and was then left with no timer at all after a MIDI Stop
+    if (syncToMIDIClk)
     {
-        sequencer_timer.stop();
-        midiClkArpCount = 0;
-        seqSwapper = true;
+        if ((!currentSequence.running && !seqMidiSync) || arpRunning)
+            seqMidiSync = true;
+        if ((state == State::SEQUENCEPAGE || state == State::SEQUENCEEDIT) && seqMidiSync)
+            sequencerStart();
+        else if (arpRunning)
+        {
+            sequencer_timer.stop();
+            midiClkArpCount = 0;
+            seqSwapper = true;
+        }
     }
     // Resync LFOs when MIDI Clock starts.
     // When there's a jump to a different
@@ -1359,21 +1392,17 @@ FLASHMEM void myMIDIClockStop()
 {
     if (midiDiscard)
         return; // Panic is flushing the MIDI inputs
-    if (seqMidiSync && syncToMIDIClk)
-    {
-        sequencerStop();
-        groupvec[activeGroupIndex]->allNotesOff();
-        resetNotes();
-    }
-    seqMidiSync = false;
-    MIDIClkSignal = false;
+    midiClockStopped();
 }
 
 void myMIDIClock()
 {
     if (midiDiscard)
         return; // Panic is flushing the MIDI inputs
+    sinceMidiClock = 0;
     MIDIClkSignal = true;
+    if (seqMidiSync && !syncToMIDIClk)
+        midiClockStopped(); // "Sync to MIDI clock" turned off while following the clock
     // 24ppq this is for 4/4 time, alternates between noteon and noteoff, 8 times
     if (seqMidiSync && syncToMIDIClk && currentSequence.running && (midiClkCount % 3) == 0)
     {
@@ -1384,20 +1413,24 @@ void myMIDIClock()
 
     if (seqMidiSync && arpRunning)
     {
-        if (midiClkArpCount == 0 && seqSwapper)
+        const uint8_t division = ARP_DIVISION_24PPQ[arpDivision];
+        // The division can be shortened while running: the count used to run on to 255
+        // (seconds of silence, with the last note left on)
+        if (midiClkArpCount >= division)
+            midiClkArpCount = 0;
+        if (midiClkArpCount == 0)
         {
+            if (!seqSwapper)
+                noteOffRoutine(); // Note-off was skipped by a division change
             noteOnRoutine();
         }
-        else if (midiClkArpCount == (ARP_DIVISION_24PPQ[arpDivision] - 2) && !seqSwapper)
+        else if (midiClkArpCount == division - 2 && !seqSwapper)
         {
             noteOffRoutine();
-            // if(DEBUG) Serial.printf("MIDIClk %d: %d", midiClkArpCount, ARP_DIVISION_24PPQ[arpDivision]);
         }
 
-        if ((midiClkArpCount + 1) == ARP_DIVISION_24PPQ[arpDivision])
+        if (++midiClkArpCount >= division)
             midiClkArpCount = 0;
-        else
-            midiClkArpCount++;
     }
 
     // This recalculates the LFO frequencies if the tempo changes (MIDI cLock is 24ppq)
@@ -3289,6 +3322,15 @@ void loop()
             ;
         sdCardDetect();
         sequencerLEDs();
+        // MIDI clock lost without a Stop (cable pulled, DAW closed): stop following it,
+        // otherwise the sequencer waits for it for ever
+        if (MIDIClkSignal && sinceMidiClock > MIDI_CLOCK_TIMEOUT_MS)
+        {
+            if (seqMidiSync)
+                midiClockStopped();
+            else
+                MIDIClkSignal = false;
+        }
         crashReportCheck();
         // Uncomment for CPU, audio memory and display stack figures (printed once a second)
         // CPUMonitor();
