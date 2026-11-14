@@ -17,6 +17,13 @@ typedef struct EncoderMappingStruct
 
 EncoderMappingStruct encMap[4] = {};
 
+// The encoder value is a byte, but tempo goes up to 300bpm (and higher from MIDI clock).
+// Only the text is shown; clamp the byte, as converting an out of range float is undefined.
+inline uint8_t bpmToEncValue(float bpm)
+{
+    return bpm <= 0.0f ? 0 : (bpm >= 255.0f ? 255 : (uint8_t)bpm);
+}
+
 // Sets the value and value string of the encoder when this parameter is on the display
 FLASHMEM boolean setEncValue(boolean act, uint8_t parameter, uint8_t value, String str, uint8_t newParameter)
 {
@@ -1596,7 +1603,7 @@ FLASHMEM void setEncodersState(State s)
         encMap[ENC_TL].Parameter = SeqTempo;
         encMap[ENC_TL].ShowValue = true;
         encMap[ENC_TL].ValueStr = String(currentSequence.bpm, 1);
-        encMap[ENC_TL].Value = currentSequence.bpm;
+        encMap[ENC_TL].Value = bpmToEncValue(currentSequence.bpm);
         encMap[ENC_TL].Range = 255;
         encMap[ENC_TL].DefaultValue = 120;
         encMap[ENC_TL].ParameterStr = ParameterStrMap[SeqTempo];
@@ -1724,7 +1731,7 @@ FLASHMEM void setEncodersState(State s)
         encMap[ENC_TL].Parameter = SeqTempo;
         encMap[ENC_TL].ShowValue = true;
         encMap[ENC_TL].ValueStr = String(currentSequence.bpm, 1);
-        encMap[ENC_TL].Value = currentSequence.bpm;
+        encMap[ENC_TL].Value = bpmToEncValue(currentSequence.bpm);
         encMap[ENC_TL].Range = 255;
         encMap[ENC_TL].DefaultValue = 120;
         encMap[ENC_TL].ParameterStr = ParameterStrMap[SeqTempo];
@@ -1759,7 +1766,7 @@ FLASHMEM void setEncodersState(State s)
         encMap[ENC_TL].Parameter = SeqTempo;
         encMap[ENC_TL].ShowValue = false; // value is shown in a different position
         encMap[ENC_TL].ValueStr = String(currentSequence.bpm, 1);
-        encMap[ENC_TL].Value = currentSequence.bpm;
+        encMap[ENC_TL].Value = bpmToEncValue(currentSequence.bpm);
         encMap[ENC_TL].Range = 255;
         encMap[ENC_TL].DefaultValue = 120;
         encMap[ENC_TL].ParameterStr = ParameterStrMap[SeqTempo];

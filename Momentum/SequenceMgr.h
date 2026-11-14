@@ -100,6 +100,28 @@ inline void setArpKeyHeld(uint8_t note, bool held)
         arpKeysHeld[(note >> 5) & 3] &= ~(1u << (note & 31));
 }
 
+// Adds a note to the arpeggio: in the order played for Play Order, otherwise sorted low to high.
+// The caller checks there's room (at most sizeof(arpNotes) - 1 notes, so the list stays terminated).
+void addArpNote(uint8_t note, uint8_t velocity)
+{
+    for (uint8_t i = 0; i < sizeof(arpNotes); i++)
+    {
+        if (arpNotes[i] == note)
+            return; // already in arpeggio (latched in Hold mode)
+        if (arpNotes[i] != '\0' && (arpStyle == PLAYORDER || arpNotes[i] < note))
+            continue;
+        // Insert here, moving the notes above it up one place
+        for (uint8_t j = sizeof(arpNotes) - 1; j > i; j--)
+        {
+            arpNotes[j] = arpNotes[j - 1];
+            arpVels[j] = arpVels[j - 1];
+        }
+        arpNotes[i] = note;
+        arpVels[i] = velocity;
+        return;
+    }
+}
+
 // Removes one note from the arpeggio, keeping the order of the others (sorted or play order)
 FLASHMEM void removeArpNote(uint8_t note)
 {

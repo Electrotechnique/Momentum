@@ -337,6 +337,19 @@ void noteOn(byte channel, byte note, byte velocity)
     groupvec[activeGroupIndex]->noteOn(note, velocity);
 }
 
+// Internal clock: a new arpeggio starts on the key press, instead of waiting up to a whole
+// division for the timer's next step. On MIDI clock it stays on the clock's grid.
+void arpStartNow()
+{
+    if (seqMidiSync || !currentSequence.running)
+        return;
+    if (!seqSwapper)
+        noteOffRoutine(); // The previous arpeggio's last note is still on
+    sequencer_timer.start();                                 // Restart the step period from now
+    sequencer_timer.setPeriod(currentSequence.tempo_us / 2); // and apply any pending tempo change
+    noteOnRoutine();
+}
+
 void myNoteOn(byte channel, byte note, byte velocity)
 {
     if (midiDiscard)
@@ -355,69 +368,19 @@ void myNoteOn(byte channel, byte note, byte velocity)
         // it continues to play the previous arpeggio. Once you press
         // a new note, it resets the arpeggio and starts a new one.
         // Also resets arpeggio from starting note.
-        if (arpNotesHeld == 0)
-        {
+        bool newArpeggio = arpNotesHeld == 0;
+        if (newArpeggio)
             resetNotes();
-            // if (getNotesInArp() == 0)
-            // {
-            //     noteOn(midiChannel, note, velocity);
-            //     setSeqTimerPeriod(currentSequence.bpm);
-            //     sequencerStart();
-            // }
-        }
         if (isArpKeyHeld(note))
             return; // Duplicate note-on (e.g. two merged MIDI sources)
-        if (arpNotesHeld < sizeof(arpNotes) - 1)
-        {
-            arpNotesHeld++;
-            setArpKeyHeld(note, true);
-        }
-        else
-            return;
-
-        // find the right place to insert the note in the notes array
-        if (arpStyle == PLAYORDER)
-        {
-            for (uint8_t i = 0; i < sizeof(arpNotes); i++)
-            {
-                if (arpNotes[i] == note)
-                    return; // already in arpeggio
-                else if (arpNotes[i] != '\0')
-                    continue;
-                else
-                {
-                    arpNotes[i] = note;
-                    arpVels[i] = velocity;
-                    return;
-                }
-            }
-        }
-        else
-        {
-            for (uint8_t i = 0; i < sizeof(arpNotes); i++)
-            {
-                if (arpNotes[i] == note)
-                    return; // already in arpeggio
-                else if (arpNotes[i] != '\0' && arpNotes[i] < note)
-                    continue; // ignore the notes below it
-                else
-                {
-                    // once we reach the first note in the arpeggio that's higher
-                    // than the new one, move the rest of the arpeggio array over
-                    // to the right
-                    for (uint8_t j = sizeof(arpNotes) - 1; j > i; j--)
-                    {
-                        arpNotes[j] = arpNotes[j - 1];
-                        arpVels[j] = arpVels[j - 1];
-                    }
-
-                    // and insert the note
-                    arpNotes[i] = note;
-                    arpVels[i] = velocity;
-                    return;
-                }
-            }
-        }
+        if (arpNotesHeld >= sizeof(arpNotes) - 1)
+            return; // Arpeggio full
+        arpNotesHeld++;
+        setArpKeyHeld(note, true);
+        addArpNote(note, velocity);
+        if (newArpeggio)
+            arpStartNow();
+        return;
     }
     else
     {
@@ -1416,7 +1379,7 @@ void myMIDIClock()
     {
         sequencer();
         if (state == SEQUENCEPAGE || state == SEQUENCEEDIT || state == ARPPAGE1 || state == ARPPAGE2)
-            setEncValue(SeqTempo, lfoSyncFreq * 60, String(lfoSyncFreq * 60, 1));
+            setEncValue(SeqTempo, bpmToEncValue(lfoSyncFreq * 60), String(lfoSyncFreq * 60, 1));
     }
 
     if (seqMidiSync && arpRunning)
@@ -1959,7 +1922,7 @@ FLASHMEM void encoderCallback(unsigned enc_idx, int value, int delta)
                 break;
             currentSequence.bpm += (newDelta / 10.0f);
             setSeqTimerPeriod(currentSequence.bpm);
-            setEncValue(SeqTempo, currentSequence.bpm, String(currentSequence.bpm, 1));
+            setEncValue(SeqTempo, bpmToEncValue(currentSequence.bpm), String(currentSequence.bpm, 1));
             break;
         case SeqLength:
             if (newDelta == 0 || currentSequence.length + newDelta < 1 || currentSequence.length + newDelta > 64)
