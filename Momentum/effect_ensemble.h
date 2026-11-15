@@ -45,6 +45,12 @@ public:
   virtual void update(void);
   // Rate is the effect amount (2.0 - 20.0); same mapping as the original table based version
   void lfoRate(float rate);
+  // Modulation depth, 0.25 - 2.0 of the original depth (1.0). Below 1.0 the taps are more
+  // alike and add up louder, so the level is trimmed a little (-2dB x (1 - depth)).
+  void depth(float scale);
+  // Base delay of the taps in samples, 224 - 796 (5.1 - 18ms); 512 (11.6ms) is the original.
+  // The range keeps every tap inside the delay line at any depth.
+  void baseDelay(float samples);
 
 private:
   audio_block_t *inputQueueArray[1];
@@ -54,6 +60,10 @@ private:
   uint32_t lfoPhaseFast;
   uint32_t lfoIncSlow;
   uint32_t lfoIncFast;
+  volatile int32_t slowDepthQ8;
+  volatile int32_t fastDepthQ8;
+  volatile int32_t levelTrimQ15; // 32768 = no trim
+  volatile int32_t baseDelayQ16;
 
   inline int32_t readTap(int32_t delayQ16);
 };

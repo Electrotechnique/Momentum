@@ -1097,6 +1097,42 @@ FLASHMEM void myControlChange(byte channel, byte control, byte value)
         if (!setEncValue(CCreverbfxmix, value, String(LINEAR[value])))
             showCurrentParameterOverlay(ParameterStrMap[CCreverbfxmix], String(LINEAR[value]));
         break;
+    case CCensemblefxdepth:
+    {
+        currentPatch.EnsembleEffectDepth = value;
+        groupvec[activeGroupIndex]->setEnsembleEffectDepth(ensembleDepth(value)); // 64 = original
+        String str = String(int(ensembleDepth(value) * 100 + 0.5f)) + F("%");
+        if (!setEncValue(CCensemblefxdepth, value, str))
+            showCurrentParameterOverlay(ParameterStrMap[CCensemblefxdepth], str);
+        break;
+    }
+    case CCensemblefxdelay:
+    {
+        currentPatch.EnsembleEffectDelay = value;
+        groupvec[activeGroupIndex]->setEnsembleEffectDelay(ensembleDelaySamples(value)); // 64 = original
+        String str = String(ensembleDelaySamples(value) * 1000.0f / AUDIO_SAMPLE_RATE_EXACT, 1) + F(" ms");
+        if (!setEncValue(CCensemblefxdelay, value, str))
+            showCurrentParameterOverlay(ParameterStrMap[CCensemblefxdelay], str);
+        break;
+    }
+    case CCreverbfxdamping:
+    {
+        currentPatch.ReverbEffectDamping = value;
+        groupvec[activeGroupIndex]->setReverbEffectDamping(value / 128.0f);
+        String str = String(int(value * 100 / 128.0f + 0.5f)) + F("%");
+        if (!setEncValue(CCreverbfxdamping, value, str))
+            showCurrentParameterOverlay(ParameterStrMap[CCreverbfxdamping], str);
+        break;
+    }
+    case CCreverbfxbasscut:
+    {
+        currentPatch.ReverbEffectBassCut = value;
+        groupvec[activeGroupIndex]->setReverbEffectBassCut(value / 128.0f);
+        String str = String(int(value * 100 / 128.0f + 0.5f)) + F("%");
+        if (!setEncValue(CCreverbfxbasscut, value, str))
+            showCurrentParameterOverlay(ParameterStrMap[CCreverbfxbasscut], str);
+        break;
+    }
     case CCallnotesoff:
         groupvec[activeGroupIndex]->allNotesOff();
         break;
@@ -1588,6 +1624,10 @@ FLASHMEM void setCurrentPatchData()
     myControlChange(midiChannel, CCensemblefxmix, currentPatch.EnsembleEffectMix);
     myControlChange(midiChannel, CCreverbfxtime, currentPatch.ReverbEffectTime);
     myControlChange(midiChannel, CCreverbfxmix, currentPatch.ReverbEffectMix);
+    myControlChange(midiChannel, CCensemblefxdepth, currentPatch.EnsembleEffectDepth);
+    myControlChange(midiChannel, CCensemblefxdelay, currentPatch.EnsembleEffectDelay);
+    myControlChange(midiChannel, CCreverbfxdamping, currentPatch.ReverbEffectDamping);
+    myControlChange(midiChannel, CCreverbfxbasscut, currentPatch.ReverbEffectBassCut);
     myControlChange(midiChannel, CCpitchenv, currentPatch.PitchEnv);
     myControlChange(midiChannel, CCvelocitySens, currentPatch.VelocitySensitivity);
     myControlChange(midiChannel, pitchmodwheeldepth, currentPatch.PitchModWheelDepth);

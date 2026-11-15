@@ -408,6 +408,11 @@ FLASHMEM boolean loadPatch(uint8_t bank, uint32_t filename)
   currentPatch.EnsembleEffectMix = doc["EnsembleEffectMix"];
   currentPatch.ReverbEffectTime = doc["ReverbEffectTime"];
   currentPatch.ReverbEffectMix = doc["ReverbEffectMix"];
+  // Added later: patches saved before have no value, so use the defaults (the old fixed settings)
+  currentPatch.EnsembleEffectDepth = doc["EnsembleEffectDepth"] | 64;
+  currentPatch.EnsembleEffectDelay = doc["EnsembleEffectDelay"] | 64;
+  currentPatch.ReverbEffectDamping = doc["ReverbEffectDamping"] | 64;
+  currentPatch.ReverbEffectBassCut = doc["ReverbEffectBassCut"] | 26;
   currentPatch.FilterEnvShape = doc["FilterEnvShape"];
   currentPatch.AmpEnvShape = doc["AmpEnvShape"];
   currentPatch.GlideShape = doc["GlideShape"];
@@ -521,6 +526,10 @@ FLASHMEM boolean savePatch(uint8_t bankIndex, uint8_t index)
   doc["EnsembleEffectMix"] = currentPatch.EnsembleEffectMix;
   doc["ReverbEffectTime"] = currentPatch.ReverbEffectTime;
   doc["ReverbEffectMix"] = currentPatch.ReverbEffectMix;
+  doc["EnsembleEffectDepth"] = currentPatch.EnsembleEffectDepth;
+  doc["EnsembleEffectDelay"] = currentPatch.EnsembleEffectDelay;
+  doc["ReverbEffectDamping"] = currentPatch.ReverbEffectDamping;
+  doc["ReverbEffectBassCut"] = currentPatch.ReverbEffectBassCut;
   doc["FilterEnvShape"] = currentPatch.FilterEnvShape;
   doc["AmpEnvShape"] = currentPatch.AmpEnvShape;
   doc["GlideShape"] = currentPatch.GlideShape;

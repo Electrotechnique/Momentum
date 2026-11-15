@@ -848,6 +848,32 @@ public:
             shared.reverb->size(reverbEffectTime);
     }
 
+    // Ensemble modulation depth, 0.0 - 2.0 of the original
+    void setEnsembleEffectDepth(float value)
+    {
+        shared.ensemble.depth(value);
+    }
+
+    // Ensemble base delay in samples (224 - 796, 512 = original)
+    void setEnsembleEffectDelay(float samples)
+    {
+        shared.ensemble.baseDelay(samples);
+    }
+
+    // Reverb tail treble loss, 0.0 - 1.0
+    void setReverbEffectDamping(float value)
+    {
+        if (shared.reverb)
+            shared.reverb->hidamp(value);
+    }
+
+    // Reverb tail bass loss, 0.0 - 1.0
+    void setReverbEffectBassCut(float value)
+    {
+        if (shared.reverb)
+            shared.reverb->lodamp(value);
+    }
+
     void setReverbEffectMix(float value)
     {
         reverbEffectMix = value;

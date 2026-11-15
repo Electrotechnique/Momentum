@@ -70,10 +70,11 @@ static inline int32_t sineQ15(uint32_t phase)
   return s0 + (((s1 - s0) * frac) >> 15);
 }
 
-// LFO modulation in samples, Q16
-static inline int32_t lfoQ16(int32_t slowQ15, int32_t fastQ15)
+// LFO modulation in samples, Q16. Depths are Q8 samples, up to 2x the original: the delay
+// then swings 512 +/- 183 samples, inside the 1024 sample buffer
+static inline int32_t lfoQ16(int32_t slowQ15, int32_t fastQ15, int32_t slowDepthQ8, int32_t fastDepthQ8)
 {
-  return (slowQ15 * SLOW_DEPTH_Q8 + fastQ15 * FAST_DEPTH_Q8) >> 7;
+  return (slowQ15 * slowDepthQ8 + fastQ15 * fastDepthQ8) >> 7;
 }
 
 AudioEffectEnsemble::AudioEffectEnsemble() : AudioStream(1, inputQueueArray)
@@ -82,7 +83,39 @@ AudioEffectEnsemble::AudioEffectEnsemble() : AudioStream(1, inputQueueArray)
   writeIndex = 0;
   lfoPhaseSlow = 0;
   lfoPhaseFast = 0;
+  slowDepthQ8 = SLOW_DEPTH_Q8;
+  fastDepthQ8 = FAST_DEPTH_Q8;
+  levelTrimQ15 = 32768;
+  baseDelayQ16 = BASE_DELAY << 16;
   lfoRate(6.0f);
+}
+
+void AudioEffectEnsemble::depth(float scale)
+{
+  if (scale < 0.25f)
+    scale = 0.25f; // below this it's a fixed comb-filtered delay, not a chorus
+  else if (scale > 2.0f)
+    scale = 2.0f;
+  // Host measurement of wet level vs depth (saw 110/440/1760Hz): 100% +2.2/-0.5/-2.5dB,
+  // 25% +5.2/+2.2/-0.5dB, 0% +6dB at every pitch. The trim keeps 25-100% near 100%'s range.
+  float trimDb = scale < 1.0f ? -2.0f * (1.0f - scale) : 0.0f;
+  int32_t trim = (int32_t)(32768.0f * powf(10.0f, trimDb / 20.0f) + 0.5f);
+  __disable_irq();
+  slowDepthQ8 = (int32_t)(SLOW_DEPTH_Q8 * scale);
+  fastDepthQ8 = (int32_t)(FAST_DEPTH_Q8 * scale);
+  levelTrimQ15 = trim;
+  __enable_irq();
+}
+
+void AudioEffectEnsemble::baseDelay(float samples)
+{
+  // At 2x depth the taps swing +/-184 samples; the cubic interpolation reads one sample
+  // before and two after
+  if (samples < 224.0f)
+    samples = 224.0f;
+  else if (samples > 796.0f)
+    samples = 796.0f;
+  baseDelayQ16 = (int32_t)(samples * 65536.0f);
 }
 
 void AudioEffectEnsemble::lfoRate(float rate)
@@ -138,7 +171,10 @@ void AudioEffectEnsemble::update(void)
 
   const uint32_t incSlow = lfoIncSlow;
   const uint32_t incFast = lfoIncFast;
-  const int32_t baseQ16 = BASE_DELAY << 16;
+  const int32_t baseQ16 = baseDelayQ16;
+  const int32_t sd = slowDepthQ8;
+  const int32_t fd = fastDepthQ8;
+  const int32_t trim = levelTrimQ15;
 
   // Tap delays from the LFOs (Q16 samples). The LFOs are below 5Hz, so they are worked out
   // every LFO_INTERVAL samples and the delays interpolated in between, rather than doing
@@ -148,9 +184,9 @@ void AudioEffectEnsemble::update(void)
     {
       uint32_t phS = phSlow + TAP_OFFSET_SLOW[t];
       int32_t fast = sineQ15(phFast + TAP_OFFSET_FAST[t]);
-      dl[t] = baseQ16 - lfoQ16(sineQ15(phS), fast);
+      dl[t] = baseQ16 - lfoQ16(sineQ15(phS), fast, sd, fd);
       // Right: fast LFO is shifted 180 degrees, i.e. negated
-      dr[t] = baseQ16 - lfoQ16(sineQ15(phS + RIGHT_OFFSET_SLOW), -fast);
+      dr[t] = baseQ16 - lfoQ16(sineQ15(phS + RIGHT_OFFSET_SLOW), -fast, sd, fd);
     }
   };
   int32_t dl[ENSEMBLE_TAPS], dr[ENSEMBLE_TAPS], stepL[ENSEMBLE_TAPS], stepR[ENSEMBLE_TAPS];
@@ -180,8 +216,15 @@ void AudioEffectEnsemble::update(void)
       dl[t] += stepL[t];
       dr[t] += stepR[t];
     }
-    outblock->data[i] = saturate16(sumL / WET_DIVISOR);
-    outblockB->data[i] = saturate16(sumR / WET_DIVISOR);
+    int32_t outL = sumL / WET_DIVISOR;
+    int32_t outR = sumR / WET_DIVISOR;
+    if (trim != 32768)
+    {
+      outL = (int32_t)(((int64_t)outL * trim) >> 15);
+      outR = (int32_t)(((int64_t)outR * trim) >> 15);
+    }
+    outblock->data[i] = saturate16(outL);
+    outblockB->data[i] = saturate16(outR);
 
     lfoPhaseSlow += incSlow;
     lfoPhaseFast += incFast;
