@@ -546,7 +546,43 @@ FLASHMEM void renderVarTriangle(float value)
   tft.setOrigin(0, 0);
 }
 
-FLASHMEM void renderEnv(float att, float dec, float sus, float rel)
+// Envelope attack level at t (0-1 of the attack time) for an envelope shape (ENVSHAPE value).
+// Exponential shapes -8..+8 follow (e^(n t) - 1) / (e^n - 1), as AudioEffectEnvelopeTS does:
+// negative rise fast then level off, positive start slowly. 0 and linear (-128) are straight.
+FLASHMEM float envAttackLevel(float t, int8_t shape)
+{
+  if (shape < -8 || shape > 8 || shape == 0)
+    return t;
+  return (expf(shape * t) - 1.0f) / (expf((float)shape) - 1.0f);
+}
+
+// Draws level(x) from x0 to x1 (pixels) as joined lines, one point per 2 pixels.
+// Level 0-1 maps to yBase .. yBase - height.
+template <typename F>
+FLASHMEM void drawEnvCurve(int16_t x0, int16_t x1, int16_t yBase, int16_t height, F level)
+{
+  if (x1 <= x0)
+    return;
+  int16_t px = x0, py = yBase - (int16_t)(level(x0) * height + 0.5f);
+  for (int16_t x = x0 + 2;; x += 2)
+  {
+    if (x > x1)
+      x = x1;
+    int16_t y = yBase - (int16_t)(level(x) * height + 0.5f);
+    tft.drawLine(px, py, x, y, ILI9341_CYAN);
+    px = x;
+    py = y;
+    if (x == x1)
+      break;
+  }
+}
+
+// ADSR picture. Times in 10s of seconds (ms * 0.0001), sustain 0-1, shape is the ENVSHAPE value
+// (-128 linear, -8..+8 exponential). Exponential decay and release fall with a time constant
+// of half their time, so the decay keeps approaching the sustain level through the sustain
+// segment, and the release is drawn to its time (about -17dB), where the tail carries on.
+// Drawn in the display thread only: no memory, and no cost to the audio.
+FLASHMEM void renderEnv(float att, float dec, float sus, float rel, int8_t shape)
 {
   const int16_t a = 200;
   const int16_t b = 188;
@@ -557,10 +593,43 @@ FLASHMEM void renderEnv(float att, float dec, float sus, float rel)
   const int16_t g = 80;
   const int16_t h = 26;
 
-  tft.drawLine(a, b, a + (att * c), f, ILI9341_CYAN);                                           // attack
-  tft.drawLine(a + (att * c), f, a + ((att + dec) * c), b - (sus * e), ILI9341_CYAN);           // decay
-  tft.drawFastHLine(a + ((att + dec) * c), b - (sus * e), g - ((att + dec) * c), ILI9341_CYAN); // sustain
-  tft.drawLine(d, b - (sus * e), d + (rel * h), b, ILI9341_CYAN);                               // release
+  if (shape < -8 || shape > 8)
+  {
+    // Linear
+    tft.drawLine(a, b, a + (att * c), f, ILI9341_CYAN);                                           // attack
+    tft.drawLine(a + (att * c), f, a + ((att + dec) * c), b - (sus * e), ILI9341_CYAN);           // decay
+    tft.drawFastHLine(a + ((att + dec) * c), b - (sus * e), g - ((att + dec) * c), ILI9341_CYAN); // sustain
+    tft.drawLine(d, b - (sus * e), d + (rel * h), b, ILI9341_CYAN);                               // release
+    tft.setOrigin(0, 0);
+    return;
+  }
+
+  const int16_t xAtt = a + (int16_t)(att * c);       // end of attack
+  const float decPx = dec * c;                        // decay width in pixels
+  const int16_t xSusEnd = a + g;                      // end of sustain segment
+  const float relPx = rel * h;
+
+  // Attack
+  if (xAtt > a)
+    drawEnvCurve(a, xAtt, b, e, [&](int16_t x)
+                 { return envAttackLevel((float)(x - a) / (xAtt - a), shape); });
+  else
+    tft.drawFastVLine(a, f, e, ILI9341_CYAN);
+
+  // Decay towards the sustain level, continuing through the sustain segment
+  auto decayLevel = [&](int16_t x)
+  { return decPx > 0.5f ? sus + (1.0f - sus) * expf(-2.0f * (x - xAtt) / decPx) : sus; };
+  drawEnvCurve(xAtt, xSusEnd, b, e, decayLevel);
+  const float relStart = decayLevel(xSusEnd);
+  if (d > xSusEnd)
+    tft.drawFastHLine(xSusEnd, b - (int16_t)(relStart * e + 0.5f), d - xSusEnd, ILI9341_CYAN);
+
+  // Release
+  if (relPx >= 1.0f)
+    drawEnvCurve(d, d + (int16_t)relPx, b, e, [&](int16_t x)
+                 { return relStart * expf(-2.0f * (x - d) / relPx); });
+  else
+    tft.drawFastVLine(d, b - (int16_t)(relStart * e + 0.5f), (int16_t)(relStart * e + 0.5f), ILI9341_CYAN);
   tft.setOrigin(0, 0);
 }
 
@@ -651,11 +720,11 @@ FLASHMEM void renderCurrentParameterOverlay()
     break;
   case FILTER_ENV:
     tft.setOrigin(-40, -30);
-    renderEnv(groupvec[activeGroupIndex]->getFilterAttack() * 0.0001f, groupvec[activeGroupIndex]->getFilterDecay() * 0.0001f, groupvec[activeGroupIndex]->getFilterSustain(), groupvec[activeGroupIndex]->getFilterRelease() * 0.0001f);
+    renderEnv(groupvec[activeGroupIndex]->getFilterAttack() * 0.0001f, groupvec[activeGroupIndex]->getFilterDecay() * 0.0001f, groupvec[activeGroupIndex]->getFilterSustain(), groupvec[activeGroupIndex]->getFilterRelease() * 0.0001f, ENVSHAPE[currentPatch.FilterEnvShape]);
     break;
   case AMP_ENV:
     tft.setOrigin(-40, -30);
-    renderEnv(groupvec[activeGroupIndex]->getAmpAttack() * 0.0001f, groupvec[activeGroupIndex]->getAmpDecay() * 0.0001f, groupvec[activeGroupIndex]->getAmpSustain(), groupvec[activeGroupIndex]->getAmpRelease() * 0.0001f);
+    renderEnv(groupvec[activeGroupIndex]->getAmpAttack() * 0.0001f, groupvec[activeGroupIndex]->getAmpDecay() * 0.0001f, groupvec[activeGroupIndex]->getAmpSustain(), groupvec[activeGroupIndex]->getAmpRelease() * 0.0001f, ENVSHAPE[currentPatch.AmpEnvShape]);
     break;
   }
 }
@@ -1170,7 +1239,8 @@ FLASHMEM void renderFilterPage(size_t no)
     renderEnv(groupvec[activeGroupIndex]->getFilterAttack() * 0.0001f,
               groupvec[activeGroupIndex]->getFilterDecay() * 0.0001f,
               groupvec[activeGroupIndex]->getFilterSustain(),
-              groupvec[activeGroupIndex]->getFilterRelease() * 0.0001f);
+              groupvec[activeGroupIndex]->getFilterRelease() * 0.0001f,
+              ENVSHAPE[currentPatch.FilterEnvShape]);
   }
   else
   {
@@ -1223,7 +1293,8 @@ FLASHMEM void renderAmpPage(size_t no)
     renderEnv(groupvec[activeGroupIndex]->getAmpAttack() * 0.0001f,
               groupvec[activeGroupIndex]->getAmpDecay() * 0.0001f,
               groupvec[activeGroupIndex]->getAmpSustain(),
-              groupvec[activeGroupIndex]->getAmpRelease() * 0.0001f);
+              groupvec[activeGroupIndex]->getAmpRelease() * 0.0001f,
+              ENVSHAPE[currentPatch.AmpEnvShape]);
   }
 }
 
