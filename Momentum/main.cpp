@@ -1104,13 +1104,15 @@ FLASHMEM void myControlChange(byte channel, byte control, byte value)
         String str = String(int(ensembleDepth(value) * 100 + 0.5f)) + F("%");
         if (!setEncValue(CCensemblefxdepth, value, str))
             showCurrentParameterOverlay(ParameterStrMap[CCensemblefxdepth], str);
+        // The depth sets the shortest delay, so the delay shown can change too
+        setEncValue(CCensemblefxdelay, currentPatch.EnsembleEffectDelay, ensembleDelayStr());
         break;
     }
     case CCensemblefxdelay:
     {
         currentPatch.EnsembleEffectDelay = value;
         groupvec[activeGroupIndex]->setEnsembleEffectDelay(ensembleDelaySamples(value)); // 64 = original
-        String str = String(ensembleDelaySamples(value) * 1000.0f / AUDIO_SAMPLE_RATE_EXACT, 1) + F(" ms");
+        String str = ensembleDelayStr();
         if (!setEncValue(CCensemblefxdelay, value, str))
             showCurrentParameterOverlay(ParameterStrMap[CCensemblefxdelay], str);
         break;

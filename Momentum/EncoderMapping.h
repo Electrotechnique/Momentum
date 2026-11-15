@@ -805,10 +805,22 @@ inline float ensembleDepth(uint8_t value)
 }
 #define ENSEMBLE_DELAY_DEFAULT 64   // 11.6ms, the original delay
 
-// Ensemble delay knob (0-127) to samples: 5.1 - 18ms, 64 = 512 samples (11.6ms, the original)
+// Ensemble delay knob (0-127) to samples: 2 - 40ms, 64 = 512 samples (11.6ms, the original).
+// Exponential either side of the middle, so each step is a similar change in character:
+// flanging at the bottom, ensemble in the middle, doubling at the top.
 inline float ensembleDelaySamples(uint8_t value)
 {
-    return 512.0f + (value - 64) * 4.5f;
+    const float shortest = 0.002f * AUDIO_SAMPLE_RATE_EXACT; // 2ms
+    const float longest = 0.040f * AUDIO_SAMPLE_RATE_EXACT;  // 40ms
+    if (value < 64)
+        return shortest * powf(512.0f / shortest, value / 64.0f);
+    return 512.0f * powf(longest / 512.0f, (value - 64) / 63.0f);
+}
+
+// Delay text for the display: the delay in use, which the depth may lengthen at the bottom
+inline String ensembleDelayStr()
+{
+    return String(groupvec[activeGroupIndex]->getEnsembleEffectDelayMs(), 1) + " ms";
 }
 #define REVERB_SIZE_DEFAULT 64      // 0.5
 #define REVERB_MIX_DEFAULT 64       // 0.5 (25% wet: the mix goes up to 50:50)
@@ -892,7 +904,7 @@ FLASHMEM void configureCCensemblefxdelay(EncoderMappingStruct *enc, State st = S
     enc->ShowValue = true;
     enc->Value = currentPatch.EnsembleEffectDelay;
     enc->DefaultValue = ENSEMBLE_DELAY_DEFAULT;
-    enc->ValueStr = String(ensembleDelaySamples(currentPatch.EnsembleEffectDelay) * 1000.0f / AUDIO_SAMPLE_RATE_EXACT, 1) + " ms";
+    enc->ValueStr = ensembleDelayStr();
     enc->Range = 127;
     enc->ParameterStr = ParameterStrMap[CCensemblefxdelay];
     enc->Push = true;

@@ -87,6 +87,8 @@ AudioEffectEnsemble::AudioEffectEnsemble() : AudioStream(1, inputQueueArray)
   fastDepthQ8 = FAST_DEPTH_Q8;
   levelTrimQ15 = 32768;
   baseDelayQ16 = BASE_DELAY << 16;
+  requestedDelay = BASE_DELAY;
+  depthScale = 1.0f;
   lfoRate(6.0f);
 }
 
@@ -105,17 +107,27 @@ void AudioEffectEnsemble::depth(float scale)
   fastDepthQ8 = (int32_t)(FAST_DEPTH_Q8 * scale);
   levelTrimQ15 = trim;
   __enable_irq();
+  depthScale = scale;
+  updateBaseDelay(); // the shortest delay depends on the depth
 }
 
 void AudioEffectEnsemble::baseDelay(float samples)
 {
-  // At 2x depth the taps swing +/-184 samples; the cubic interpolation reads one sample
-  // before and two after
-  if (samples < 224.0f)
-    samples = 224.0f;
-  else if (samples > 796.0f)
-    samples = 796.0f;
-  baseDelayQ16 = (int32_t)(samples * 65536.0f);
+  requestedDelay = samples;
+  updateBaseDelay();
+}
+
+void AudioEffectEnsemble::updateBaseDelay()
+{
+  // The taps swing +/-(55 + 36.67) samples x depth around the base delay, and the cubic
+  // interpolation reads one sample before and two after the tap
+  const float reach = (55.0f + 36.67f) * depthScale + 4.0f;
+  float s = requestedDelay;
+  if (s < reach)
+    s = reach;
+  else if (s > ENSEMBLE_BUFFER_SIZE - reach)
+    s = ENSEMBLE_BUFFER_SIZE - reach;
+  baseDelayQ16 = (int32_t)(s * 65536.0f);
 }
 
 void AudioEffectEnsemble::lfoRate(float rate)

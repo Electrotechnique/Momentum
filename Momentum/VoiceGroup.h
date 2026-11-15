@@ -854,10 +854,17 @@ public:
         shared.ensemble.depth(value);
     }
 
-    // Ensemble base delay in samples (224 - 796, 512 = original)
+    // Ensemble base delay in samples (512 = original); limited by the depth, see below
     void setEnsembleEffectDelay(float samples)
     {
         shared.ensemble.baseDelay(samples);
+    }
+
+    // The ensemble delay in use, in ms: it can't be shorter than the LFO swing at the
+    // current depth (about 2.2ms at 100% depth, 4.2ms at 200%)
+    float getEnsembleEffectDelayMs()
+    {
+        return shared.ensemble.effectiveDelaySamples() * 1000.0f / AUDIO_SAMPLE_RATE_EXACT;
     }
 
     // Reverb tail treble loss, 0.0 - 1.0

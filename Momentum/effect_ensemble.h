@@ -34,7 +34,7 @@
 #include <Arduino.h>
 #include "AudioStream.h"
 
-#define ENSEMBLE_BUFFER_SIZE 1024 // must be a power of two
+#define ENSEMBLE_BUFFER_SIZE 2048 // must be a power of two; 46ms, room for a 40ms delay at any depth
 #define ENSEMBLE_BUFFER_MASK (ENSEMBLE_BUFFER_SIZE - 1)
 #define ENSEMBLE_TAPS 6
 
@@ -48,9 +48,12 @@ public:
   // Modulation depth, 0.25 - 2.0 of the original depth (1.0). Below 1.0 the taps are more
   // alike and add up louder, so the level is trimmed a little (-2dB x (1 - depth)).
   void depth(float scale);
-  // Base delay of the taps in samples, 224 - 796 (5.1 - 18ms); 512 (11.6ms) is the original.
-  // The range keeps every tap inside the delay line at any depth.
+  // Base delay of the taps in samples; 512 (11.6ms) is the original. Used as set, except that
+  // it can't be shorter than the LFO swing at the current depth (about 2.2ms at 100%, 4.2ms at
+  // 200%), so the taps never reach the write position.
   void baseDelay(float samples);
+  // The base delay in use, in samples (after the depth limit)
+  float effectiveDelaySamples() { return baseDelayQ16 * (1.0f / 65536.0f); }
 
 private:
   audio_block_t *inputQueueArray[1];
@@ -64,6 +67,10 @@ private:
   volatile int32_t fastDepthQ8;
   volatile int32_t levelTrimQ15; // 32768 = no trim
   volatile int32_t baseDelayQ16;
+  float requestedDelay; // samples, as set with baseDelay()
+  float depthScale;     // as set with depth()
+
+  void updateBaseDelay();
 
   inline int32_t readTap(int32_t delayQ16);
 };
