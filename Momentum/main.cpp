@@ -551,20 +551,23 @@ FLASHMEM void myControlChange(byte channel, byte control, byte value)
 
     case CCdetune:
     {
-        float detune = 1.0f - (MAXDETUNE * POWER[value]);
-        groupvec[activeGroupIndex]->params().detune = detune;
-        groupvec[activeGroupIndex]->params().chordDetune = value;
-        groupvec[activeGroupIndex]->updateVoices();
-
+        // One control for two values: the chord in Chord unison mode, otherwise the detune.
+        // Only the one the mode uses is changed (it used to set both, so a detune change -
+        // including the one made when a patch is loaded - replaced the stored chord: GitHub #13)
         if (groupvec[activeGroupIndex]->params().unisonMode == 2) // Chord Detune
         {
             currentPatch.ChordDetune = value;
+            groupvec[activeGroupIndex]->params().chordDetune = value;
+            groupvec[activeGroupIndex]->updateVoices();
             if (!setEncValue(CCdetune, value, CDT_STR[value]))
                 showCurrentParameterOverlay(F("Chord"), CDT_STR[value]);
         }
         else
         {
+            float detune = 1.0f - (MAXDETUNE * POWER[value]);
             currentPatch.Detune = value;
+            groupvec[activeGroupIndex]->params().detune = detune;
+            groupvec[activeGroupIndex]->updateVoices();
             if (!setEncValue(CCdetune, value, String((1 - detune) * 100) + F("%")))
                 showCurrentParameterOverlay(ParameterStrMap[CCdetune], String((1 - detune) * 100) + F("%"));
         }
@@ -1582,9 +1585,13 @@ FLASHMEM void setCurrentPatchData()
     myControlChange(midiChannel, CCoscLevelA, currentPatch.OscLevelA);
     myControlChange(midiChannel, CCoscLevelB, currentPatch.OscLevelB);
     myControlChange(midiChannel, CCnoiseLevel, currentPatch.NoiseLevel);
+    // Both detune values, whatever the unison mode (CCdetune sets only the one the mode
+    // uses). Before the unison mode, so the detune shown for the mode is this patch's
+    groupvec[activeGroupIndex]->params().detune = 1.0f - (MAXDETUNE * POWER[currentPatch.Detune]);
+    groupvec[activeGroupIndex]->params().chordDetune = currentPatch.ChordDetune;
+    groupvec[activeGroupIndex]->updateVoices();
     myControlChange(midiChannel, CCunison, currentPatch.Unison);
     myControlChange(midiChannel, CCoscfx, currentPatch.OscFX);
-    myControlChange(midiChannel, CCdetune, currentPatch.Detune);
     myControlChange(midiChannel, CCoscLfoRate, currentPatch.PitchLFORate);
     myControlChange(midiChannel, CCkeytracking, currentPatch.KeyTracking);
     myControlChange(midiChannel, CCglide, currentPatch.Glide);
