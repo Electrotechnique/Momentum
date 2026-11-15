@@ -48,7 +48,8 @@ FLASHMEM void concatPerformanceFolderAndFilename(uint32_t filename, char *result
 }
 
 // Performancename from a files and return it
-FLASHMEM char *getPerformanceName(File file)
+// Returns a copy: the JsonDocument is on this function's stack (see getPatchName)
+FLASHMEM String getPerformanceName(File file)
 {
     // Allocate a temporary JsonDocument
     // Don't forget to change the capacity to match your requirements.
@@ -61,10 +62,9 @@ FLASHMEM char *getPerformanceName(File file)
     {
         if (DEBUG)
             Serial.println(F("getPerformanceName() - Failed to read file"));
-        return "Failed to read file";
+        return F("Failed to read file");
     }
-    // Copy values from the JsonDocument to the PerformanceStruct
-    return doc["PerformanceName"];
+    return String(doc["PerformanceName"] | "");
 }
 
 FLASHMEM void loadPerformanceNames()

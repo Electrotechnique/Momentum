@@ -86,6 +86,11 @@ typedef struct PatchStruct
     uint8_t EnsembleEffectMix = 31;
     uint8_t ReverbEffectTime = 8;
     uint8_t ReverbEffectMix = 0;
+    // Defaults give the settings these used to be fixed at
+    uint8_t EnsembleEffectDepth = 64;  // 64 = original depth (25-200%)
+    uint8_t EnsembleEffectDelay = 64;  // 64 = 11.6ms, the original (2-40ms)
+    uint8_t ReverbEffectDamping = 64;  // 64 = 0.5
+    uint8_t ReverbEffectBassCut = 26;  // 26 = 0.2
     uint8_t PitchEnv = 63; // Centre off
     uint8_t VelocitySensitivity = 0;
     uint8_t FilterVelocitySensitivity = 0;

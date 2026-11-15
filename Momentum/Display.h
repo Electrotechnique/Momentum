@@ -18,6 +18,10 @@
 #define SPICLOCK_READ 80'000'000
 
 #define DISPLAYTIMEOUT 700
+#define DISPLAY_FRAME_MS 30    // Minimum time between screen refreshes (~33fps max)
+#define DISPLAY_THREAD_TICKS 1 // Display thread time slice in 1ms ticks. Main loop (MIDI) waits at most this long
+#define DISPLAY_THREAD_STACK 8192 // bytes. TeensyThreads' default 1KB was too small for font and String rendering
+#define DISPLAY_STACK_FILL 0xA5   // Unused stack pattern, for measuring the most stack used
 
 #include "Voice.h"
 #include <utils.h>
@@ -77,6 +81,19 @@ const uint32_t encTriColour[4] = {ILI9341_LIGHTBLUE, ILI9341_YELLOW, ILI9341_WHI
 
 unsigned long timer = 0;
 boolean updateDisplay = true;
+
+// SD card firmware update (FirmwareUpdate.h)
+String fwFileName = "";         // firmware file on the SD card
+String fwRenamedTo = "";        // what a faulty file was renamed to
+String fwFileVersion = "";      // version in the firmware file on the SD card
+
+// File name for the display, shortened if it wouldn't fit
+FLASHMEM String fwDisplayName(const String &name)
+{
+  return name.length() > 34 ? name.substring(0, 31) + "..." : name;
+}
+String fwMessage = "";          // reason, if the update failed
+volatile uint8_t fwProgress = 0; // % of the file read and written
 
 void startTimer()
 {
@@ -496,6 +513,7 @@ FLASHMEM void renderVoiceGrid()
 
 FLASHMEM void setPatchNoAndNameForDisp(String number, String patchName)
 {
+  LockGuard lock(displayLock);
   currentPgmNum = number;
   currentPatchName = patchName;
 }
@@ -541,7 +559,43 @@ FLASHMEM void renderVarTriangle(float value)
   tft.setOrigin(0, 0);
 }
 
-FLASHMEM void renderEnv(float att, float dec, float sus, float rel)
+// Envelope attack level at t (0-1 of the attack time) for an envelope shape (ENVSHAPE value).
+// Exponential shapes -8..+8 follow (e^(n t) - 1) / (e^n - 1), as AudioEffectEnvelopeTS does:
+// negative rise fast then level off, positive start slowly. 0 and linear (-128) are straight.
+FLASHMEM float envAttackLevel(float t, int8_t shape)
+{
+  if (shape < -8 || shape > 8 || shape == 0)
+    return t;
+  return (expf(shape * t) - 1.0f) / (expf((float)shape) - 1.0f);
+}
+
+// Draws level(x) from x0 to x1 (pixels) as joined lines, one point per 2 pixels.
+// Level 0-1 maps to yBase .. yBase - height.
+template <typename F>
+FLASHMEM void drawEnvCurve(int16_t x0, int16_t x1, int16_t yBase, int16_t height, F level)
+{
+  if (x1 <= x0)
+    return;
+  int16_t px = x0, py = yBase - (int16_t)(level(x0) * height + 0.5f);
+  for (int16_t x = x0 + 2;; x += 2)
+  {
+    if (x > x1)
+      x = x1;
+    int16_t y = yBase - (int16_t)(level(x) * height + 0.5f);
+    tft.drawLine(px, py, x, y, ILI9341_CYAN);
+    px = x;
+    py = y;
+    if (x == x1)
+      break;
+  }
+}
+
+// ADSR picture. Times in 10s of seconds (ms * 0.0001), sustain 0-1, shape is the ENVSHAPE value
+// (-128 linear, -8..+8 exponential). Exponential decay and release fall with a time constant
+// of half their time, so the decay keeps approaching the sustain level through the sustain
+// segment, and the release is drawn to its time (about -17dB), where the tail carries on.
+// Drawn in the display thread only: no memory, and no cost to the audio.
+FLASHMEM void renderEnv(float att, float dec, float sus, float rel, int8_t shape)
 {
   const int16_t a = 200;
   const int16_t b = 188;
@@ -552,10 +606,43 @@ FLASHMEM void renderEnv(float att, float dec, float sus, float rel)
   const int16_t g = 80;
   const int16_t h = 26;
 
-  tft.drawLine(a, b, a + (att * c), f, ILI9341_CYAN);                                           // attack
-  tft.drawLine(a + (att * c), f, a + ((att + dec) * c), b - (sus * e), ILI9341_CYAN);           // decay
-  tft.drawFastHLine(a + ((att + dec) * c), b - (sus * e), g - ((att + dec) * c), ILI9341_CYAN); // sustain
-  tft.drawLine(d, b - (sus * e), d + (rel * h), b, ILI9341_CYAN);                               // release
+  if (shape < -8 || shape > 8)
+  {
+    // Linear
+    tft.drawLine(a, b, a + (att * c), f, ILI9341_CYAN);                                           // attack
+    tft.drawLine(a + (att * c), f, a + ((att + dec) * c), b - (sus * e), ILI9341_CYAN);           // decay
+    tft.drawFastHLine(a + ((att + dec) * c), b - (sus * e), g - ((att + dec) * c), ILI9341_CYAN); // sustain
+    tft.drawLine(d, b - (sus * e), d + (rel * h), b, ILI9341_CYAN);                               // release
+    tft.setOrigin(0, 0);
+    return;
+  }
+
+  const int16_t xAtt = a + (int16_t)(att * c);       // end of attack
+  const float decPx = dec * c;                        // decay width in pixels
+  const int16_t xSusEnd = a + g;                      // end of sustain segment
+  const float relPx = rel * h;
+
+  // Attack
+  if (xAtt > a)
+    drawEnvCurve(a, xAtt, b, e, [&](int16_t x)
+                 { return envAttackLevel((float)(x - a) / (xAtt - a), shape); });
+  else
+    tft.drawFastVLine(a, f, e, ILI9341_CYAN);
+
+  // Decay towards the sustain level, continuing through the sustain segment
+  auto decayLevel = [&](int16_t x)
+  { return decPx > 0.5f ? sus + (1.0f - sus) * expf(-2.0f * (x - xAtt) / decPx) : sus; };
+  drawEnvCurve(xAtt, xSusEnd, b, e, decayLevel);
+  const float relStart = decayLevel(xSusEnd);
+  if (d > xSusEnd)
+    tft.drawFastHLine(xSusEnd, b - (int16_t)(relStart * e + 0.5f), d - xSusEnd, ILI9341_CYAN);
+
+  // Release
+  if (relPx >= 1.0f)
+    drawEnvCurve(d, d + (int16_t)relPx, b, e, [&](int16_t x)
+                 { return relStart * expf(-2.0f * (x - d) / relPx); });
+  else
+    tft.drawFastVLine(d, b - (int16_t)(relStart * e + 0.5f), (int16_t)(relStart * e + 0.5f), ILI9341_CYAN);
   tft.setOrigin(0, 0);
 }
 
@@ -646,11 +733,11 @@ FLASHMEM void renderCurrentParameterOverlay()
     break;
   case FILTER_ENV:
     tft.setOrigin(-40, -30);
-    renderEnv(groupvec[activeGroupIndex]->getFilterAttack() * 0.0001f, groupvec[activeGroupIndex]->getFilterDecay() * 0.0001f, groupvec[activeGroupIndex]->getFilterSustain(), groupvec[activeGroupIndex]->getFilterRelease() * 0.0001f);
+    renderEnv(groupvec[activeGroupIndex]->getFilterAttack() * 0.0001f, groupvec[activeGroupIndex]->getFilterDecay() * 0.0001f, groupvec[activeGroupIndex]->getFilterSustain(), groupvec[activeGroupIndex]->getFilterRelease() * 0.0001f, ENVSHAPE[currentPatch.FilterEnvShape]);
     break;
   case AMP_ENV:
     tft.setOrigin(-40, -30);
-    renderEnv(groupvec[activeGroupIndex]->getAmpAttack() * 0.0001f, groupvec[activeGroupIndex]->getAmpDecay() * 0.0001f, groupvec[activeGroupIndex]->getAmpSustain(), groupvec[activeGroupIndex]->getAmpRelease() * 0.0001f);
+    renderEnv(groupvec[activeGroupIndex]->getAmpAttack() * 0.0001f, groupvec[activeGroupIndex]->getAmpDecay() * 0.0001f, groupvec[activeGroupIndex]->getAmpSustain(), groupvec[activeGroupIndex]->getAmpRelease() * 0.0001f, ENVSHAPE[currentPatch.AmpEnvShape]);
     break;
   }
 }
@@ -1165,7 +1252,8 @@ FLASHMEM void renderFilterPage(size_t no)
     renderEnv(groupvec[activeGroupIndex]->getFilterAttack() * 0.0001f,
               groupvec[activeGroupIndex]->getFilterDecay() * 0.0001f,
               groupvec[activeGroupIndex]->getFilterSustain(),
-              groupvec[activeGroupIndex]->getFilterRelease() * 0.0001f);
+              groupvec[activeGroupIndex]->getFilterRelease() * 0.0001f,
+              ENVSHAPE[currentPatch.FilterEnvShape]);
   }
   else
   {
@@ -1218,7 +1306,8 @@ FLASHMEM void renderAmpPage(size_t no)
     renderEnv(groupvec[activeGroupIndex]->getAmpAttack() * 0.0001f,
               groupvec[activeGroupIndex]->getAmpDecay() * 0.0001f,
               groupvec[activeGroupIndex]->getAmpSustain(),
-              groupvec[activeGroupIndex]->getAmpRelease() * 0.0001f);
+              groupvec[activeGroupIndex]->getAmpRelease() * 0.0001f,
+              ENVSHAPE[currentPatch.AmpEnvShape]);
   }
 }
 
@@ -1622,25 +1711,64 @@ FLASHMEM void renderSettingsPage()
   renderCorners();
 }
 
+// Firmware file found on the SD card at power up: Update or Cancel
+FLASHMEM void renderFirmwareConfirmPage()
+{
+  tft.fillScreen(ILI9341_BLACK);
+  tft.setFont(Arial_16);
+  tft.setTextDatum(TC_DATUM);
+  tft.setTextColor(ILI9341_ORANGE);
+  tft.drawString("Firmware Update Found", 160, 70);
+  tft.setTextColor(ILI9341_WHITE);
+  tft.drawString(String(VERSION) + "  ->  " + fwFileVersion, 160, 105);
+  tft.setFont(Arial_12);
+  tft.setTextColor(ILI9341_MIDGREY);
+  tft.drawString(fwDisplayName(fwFileName), 160, 135);
+  renderCorners();
+}
+
 FLASHMEM void renderFirmwareUpdatePage()
 {
   tft.fillScreen(ILI9341_BLACK);
   tft.setFont(Arial_16);
   tft.setTextColor(ILI9341_ORANGE);
   tft.setTextDatum(TC_DATUM);
-  tft.drawString("Updating Firmware", 160, 150);
+  tft.drawString("Updating Firmware " + fwFileVersion, 160, 80);
+  // Progress bar
+  tft.drawRect(60, 120, 200, 16, ILI9341_WHITE);
+  tft.fillRect(62, 122, (196 * fwProgress) / 100, 12, ILI9341_ORANGE);
+  tft.setFont(Arial_12);
+  tft.setTextColor(ILI9341_MIDGREY);
+  tft.drawString("Do not power off", 160, 150);
 }
 
+// Last page before the new firmware is copied into place: the screen can't change after this
+FLASHMEM void renderFirmwareInstallPage()
+{
+  tft.fillScreen(ILI9341_BLACK);
+  tft.setFont(Arial_16);
+  tft.setTextColor(ILI9341_ORANGE);
+  tft.setTextDatum(TC_DATUM);
+  tft.drawString("Installing Firmware " + fwFileVersion, 160, 90);
+  tft.setTextColor(ILI9341_RED);
+  tft.drawString("Do not power off", 160, 120);
+  tft.setFont(Arial_12);
+  tft.setTextColor(ILI9341_MIDGREY);
+  tft.drawString("Momentum restarts when it's finished", 160, 150);
+}
+
+// First power up of the new firmware: the file has been deleted
 FLASHMEM void renderFirmwareDeletePage()
 {
   tft.fillScreen(ILI9341_BLACK);
   tft.setFont(Arial_16);
-  tft.setTextColor(ILI9341_RED);
+  tft.setTextColor(ILI9341_GREEN);
   tft.setTextDatum(TC_DATUM);
-  tft.drawString("Firmware Update Complete", 160, 110);
-  tft.setTextColor(ILI9341_ORANGE);
-  tft.drawString("Delete Firmware", 160, 130);
-  tft.drawString("File from SD Card", 160, 150);
+  tft.drawString("Firmware Updated to " + String(VERSION), 160, 100);
+  tft.setFont(Arial_12);
+  tft.setTextColor(ILI9341_MIDGREY);
+  tft.drawString(fwDisplayName(fwFileName), 160, 135);
+  tft.drawString("deleted from SD card", 160, 155);
 }
 
 FLASHMEM void renderFirmwareUpdateAbortPage()
@@ -1649,13 +1777,20 @@ FLASHMEM void renderFirmwareUpdateAbortPage()
   tft.setFont(Arial_16);
   tft.setTextColor(ILI9341_RED);
   tft.setTextDatum(TC_DATUM);
-  tft.drawString("Aborting Firmware Update", 160, 110);
+  tft.drawString("Firmware Update Failed", 160, 80);
+  tft.setFont(Arial_12);
+  tft.setTextColor(ILI9341_WHITE);
+  tft.drawString(fwMessage, 160, 115);
+  tft.setTextColor(ILI9341_MIDGREY);
+  tft.drawString("The firmware is unchanged", 160, 145);
+  tft.drawString("File renamed " + fwDisplayName(fwRenamedTo), 160, 165);
 }
 
 FLASHMEM void showCurrentParameterOverlay2(const char *param, float val, int pType)
 {
   if (!updateDisplay)
     return;
+  LockGuard lock(displayLock);
   currentParameter = param;
   currentValue = String(val);
   currentFloatValue = val;
@@ -1668,6 +1803,7 @@ FLASHMEM void showCurrentParameterOverlay(String param, String val, int pType)
   // Prevents all the changing parameters showing when a patch is loaded
   if (!updateDisplay)
     return;
+  LockGuard lock(displayLock);
   currentParameter = param;
   currentValue = val;
   paramType = pType;
@@ -1684,30 +1820,96 @@ FLASHMEM void enableScope(boolean enable)
   enable ? global.scope.ScreenSetup(&tft) : global.scope.ScreenSetup(NULL);
 }
 
+// Send the frame buffer to the display using DMA so the CPU is free during the
+// SPI transfer (~18ms for a full 320x240 frame). Falls back to a blocking update.
+// Period in samples of the lowest held note's audible oscillator, 0 if no notes are held.
+// Locks the scope timebase to the waveform.
+float scopePeriodSamples()
+{
+  VoiceGroup *g = groupvec[activeGroupIndex];
+  int lowest = 128;
+  for (uint8_t i = 0; i < g->size(); i++)
+  {
+    Voice *v = (*g)[i];
+    if (v->on() && v->note() < lowest)
+      lowest = v->note();
+  }
+  if (lowest > 127)
+    return 0.0f;
+  VoiceParams &p = g->params();
+  int noteA = lowest + p.oscPitchA;
+  int noteB = lowest + p.oscPitchB;
+  float freq = 0.0f;
+  if (g->getOscLevelA() > 0.01f && noteA >= 0 && noteA < 128)
+    freq = NOTEFREQS[noteA];
+  if (g->getOscLevelB() > 0.01f && noteB >= 0 && noteB < 128 && (freq == 0.0f || NOTEFREQS[noteB] < freq))
+    freq = NOTEFREQS[noteB];
+  if (freq == 0.0f)
+    freq = NOTEFREQS[lowest];
+  return AUDIO_SAMPLE_RATE_EXACT / (freq * tuningCentsFrac);
+}
+
+// The oscilloscope is drawn on the main page only (it used to be drawn over every page)
+void updateScreenDMA(bool showScope = false)
+{
+  if (showScope)
+  {
+    global.scope.setPeriod(scopePeriodSamples());
+    global.scope.Display(); // Draws only if the scope is enabled
+  }
+  if (tft.updateScreenAsync(false))
+  {
+    // A full frame takes ~18ms. Report a stalled transfer, to tell it apart from other
+    // causes should the display freeze (the driver's T4 DMA has a single completion
+    // interrupt, so it isn't expected)
+    elapsedMillis waiting;
+    bool reported = false;
+    while (tft.asyncUpdateActive())
+    {
+      if (!reported && waiting > 500)
+      {
+        reported = true;
+        Serial.println(F("DMA screen update stalled"));
+      }
+      threads.yield();
+    }
+  }
+  else
+  {
+    tft.updateScreen();
+  }
+}
+
 void displayThread()
 {
   threads.delay(1500); // Give bootup page chance to display
+  elapsedMillis frameTime;
   while (1)
   {
+    frameTime = 0;
+    uint32_t pauseMs = 0;
+    bool showScope = false;
+    // Render into the frame buffer while holding the lock, so the main loop can't change
+    // the Strings, encoder map and lists being drawn. The SPI transfer below runs without it.
+    displayLock.lock();
     if ((millis() - timer) > DISPLAYTIMEOUT)
     {
       switch (state)
       {
       case State::MAIN:
         renderMainPage();
+        showScope = true;
         break;
       case State::PATCHLIST:
         renderPatchRecallPage();
         break;
       case State::SAVE:
         renderSavePage();
-        tft.updateScreen(); // update before delay
-        threads.delay(1000);
+        pauseMs = 1000; // Shown for a second, below (not while holding the lock)
         break;
       case State::REINITIALISE:
         renderReinitialisePage();
-        tft.updateScreen(); // update before delay
-        threads.delay(1000);
+        pauseMs = 1000; // Shown for a second, below (not while holding the lock)
         break;
       case State::PATCHSAVING:
         renderPatchSavingPage();
@@ -1722,13 +1924,11 @@ void displayThread()
         break;
       case State::DELETEMSG:
         renderDeleteMessagePage();
-        tft.updateScreen(); // update before delay
-        threads.delay(1000);
+        pauseMs = 1000; // Shown for a second, below (not while holding the lock)
         break;
       case State::DELETEBANKMSG:
         renderDeleteBankMessagePage();
-        tft.updateScreen(); // update before delay
-        threads.delay(1000);
+        pauseMs = 1000; // Shown for a second, below (not while holding the lock)
         break;
       case State::SETTINGS:
         renderSettingsPage();
@@ -1846,6 +2046,13 @@ void displayThread()
         break;
       case State::FIRMWAREDELETE:
         renderFirmwareDeletePage();
+        break;
+      case State::FIRMWARECONFIRM:
+        renderFirmwareConfirmPage();
+        break;
+      case State::FIRMWAREINSTALL:
+        renderFirmwareInstallPage();
+        break;
       default:
         break;
       }
@@ -1854,8 +2061,27 @@ void displayThread()
     {
       renderCurrentParameterOverlay();
     }
-    tft.updateScreen();
+    displayLock.unlock();
+    updateScreenDMA(showScope);
+    if (pauseMs)
+      threads.delay(pauseMs);
+    // Yield the CPU back to the main loop (MIDI handling) for the rest of the frame
+    if (frameTime < DISPLAY_FRAME_MS)
+      threads.delay(DISPLAY_FRAME_MS - frameTime);
   }
+}
+
+// Display thread stack in fast RAM (DTCM). The default stack is 1KB allocated on the heap,
+// so an overflow silently corrupted the heap.
+static uint8_t displayThreadStack[DISPLAY_THREAD_STACK] __attribute__((aligned(8)));
+
+// Most display thread stack ever used, in bytes (for CPUMonitor)
+uint32_t displayStackUsed()
+{
+  uint32_t i = 0;
+  while (i < DISPLAY_THREAD_STACK && displayThreadStack[i] == DISPLAY_STACK_FILL)
+    i++;
+  return DISPLAY_THREAD_STACK - i;
 }
 
 void setupDisplay()
@@ -1867,7 +2093,11 @@ void setupDisplay()
   tft.setTextWrap(false);
   renderBootUpPage();
   tft.updateScreen();
-  threads.addThread(displayThread);
+  memset(displayThreadStack, DISPLAY_STACK_FILL, sizeof(displayThreadStack));
+  int displayThreadId = threads.addThread(displayThread, 0, DISPLAY_THREAD_STACK, displayThreadStack);
+  // Default slice is 10ms, which could hold off MIDI note handling by up to 10ms
+  if (displayThreadId > 0)
+    threads.setTimeSlice(displayThreadId, DISPLAY_THREAD_TICKS);
 }
 
 #endif

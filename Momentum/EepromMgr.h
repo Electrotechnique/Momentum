@@ -21,6 +21,47 @@
 #define EEPROM_SEND_CC 18
 #define EEPROM_LAST_SEQUENCE 19
 #define EEPROM_SYNC_TO_MIDI_CLK 20
+#define EEPROM_SAME_VOICE_RETRIG 21
+
+// EEPROM on Teensy 4 is flash: every write runs with all interrupts off (a fraction of a
+// millisecond), and about every 2000 writes a sector erase stops everything, audio included,
+// for tens of milliseconds. Values that change continuously (volume from MIDI CC, encoder
+// turns, patch changes) are therefore saved once they have been still for EEPROM_DEFER_MS.
+// eepromFlushDeferred() is called from loop(). The getters are only used at start-up.
+#define EEPROM_DEFER_MS 2000
+#define EEPROM_DEFER_SLOTS 32 // covers every address used here
+uint8_t eepromPendingValue[EEPROM_DEFER_SLOTS];
+bool eepromPending[EEPROM_DEFER_SLOTS] = {};
+bool eepromAnyPending = false;
+elapsedMillis eepromSinceChange;
+
+FLASHMEM void eepromUpdateDeferred(int address, uint8_t value)
+{
+  if (address < 0 || address >= EEPROM_DEFER_SLOTS)
+  {
+    EEPROM.update(address, value);
+    return;
+  }
+  eepromPendingValue[address] = value;
+  eepromPending[address] = true;
+  eepromAnyPending = true;
+  eepromSinceChange = 0;
+}
+
+FLASHMEM void eepromFlushDeferred()
+{
+  if (!eepromAnyPending || eepromSinceChange < EEPROM_DEFER_MS)
+    return;
+  eepromAnyPending = false;
+  for (int i = 0; i < EEPROM_DEFER_SLOTS; i++)
+  {
+    if (eepromPending[i])
+    {
+      eepromPending[i] = false;
+      EEPROM.update(i, eepromPendingValue[i]); // Only writes if it changed
+    }
+  }
+}
 
 FLASHMEM int8_t getFirstRun()
 {
@@ -52,6 +93,18 @@ FLASHMEM void storeSyncToMIDIClkToEEPROM(byte cc)
   EEPROM.update(EEPROM_SYNC_TO_MIDI_CLK, cc);
 }
 
+// Note retrigger: 0 = Rotate (a repeated note takes the next voice), 1 = Same Voice.
+// Unset EEPROM (0xFF) reads as Rotate, the previous behaviour.
+FLASHMEM bool getSameVoiceRetrig()
+{
+  return EEPROM.read(EEPROM_SAME_VOICE_RETRIG) == 1;
+}
+
+FLASHMEM void storeSameVoiceRetrigToEEPROM(byte same)
+{
+  EEPROM.update(EEPROM_SAME_VOICE_RETRIG, same);
+}
+
 
 FLASHMEM int8_t getLastBank()
 {
@@ -71,7 +124,7 @@ FLASHMEM int8_t getLastSequence()
 
 FLASHMEM void storeLastBankToEEPROM(byte type)
 {
-  EEPROM.update(EEPROM_LAST_BANK, type);
+  eepromUpdateDeferred(EEPROM_LAST_BANK, type);
 }
 
 FLASHMEM int8_t getLastPatch()
@@ -84,12 +137,12 @@ FLASHMEM int8_t getLastPatch()
 
 FLASHMEM void storeLastPatchToEEPROM(byte type)
 {
-  EEPROM.update(EEPROM_LAST_PATCH, type);
+  eepromUpdateDeferred(EEPROM_LAST_PATCH, type);
 }
 
 FLASHMEM void storeLastSequenceToEEPROM(byte type)
 {
-  EEPROM.update(EEPROM_LAST_SEQUENCE, type);
+  eepromUpdateDeferred(EEPROM_LAST_SEQUENCE, type);
 }
 
 FLASHMEM void loadLastPatchUsed()
@@ -108,7 +161,7 @@ FLASHMEM int8_t getVolume()
 
 FLASHMEM void storeVolumeToEEPROM(byte type)
 {
-  EEPROM.update(EEPROM_VOLUME, type);
+  eepromUpdateDeferred(EEPROM_VOLUME, type);
 }
 
 FLASHMEM int getMIDIChannel()
@@ -199,7 +252,7 @@ FLASHMEM int8_t getArpStyle()
 
 FLASHMEM void storeArpRangeToEEPROM(byte range)
 {
-  EEPROM.update(EEPROM_ARP_RANGE, range);
+  eepromUpdateDeferred(EEPROM_ARP_RANGE, range);
 }
 
 FLASHMEM int8_t getArpRange()
@@ -212,7 +265,7 @@ FLASHMEM int8_t getArpRange()
 
 FLASHMEM void storeArpDivisionToEEPROM(byte div)
 {
-  EEPROM.update(EEPROM_ARP_DIVISION, div);
+  eepromUpdateDeferred(EEPROM_ARP_DIVISION, div);
 }
 
 FLASHMEM int8_t getArpDivision()
@@ -225,7 +278,7 @@ FLASHMEM int8_t getArpDivision()
 
 FLASHMEM void storeArpCyclesToEEPROM(byte c)
 {
-  EEPROM.update(EEPROM_ARP_CYCLES, c);
+  eepromUpdateDeferred(EEPROM_ARP_CYCLES, c);
 }
 
 FLASHMEM int8_t getArpCycles()
@@ -238,7 +291,7 @@ FLASHMEM int8_t getArpCycles()
 
 FLASHMEM void storeArpBasisToEEPROM(byte c)
 {
-  EEPROM.update(EEPROM_ARP_BASIS, c);
+  eepromUpdateDeferred(EEPROM_ARP_BASIS, c);
 }
 
 FLASHMEM int8_t getArpBasis()
@@ -251,7 +304,7 @@ FLASHMEM int8_t getArpBasis()
 
 FLASHMEM void storeKeyboardBasisToEEPROM(byte c)
 {
-  EEPROM.update(EEPROM_KEYBOARD_BASIS, c);
+  eepromUpdateDeferred(EEPROM_KEYBOARD_BASIS, c);
 }
 
 FLASHMEM int8_t getKeyboardBasis()
@@ -264,7 +317,7 @@ FLASHMEM int8_t getKeyboardBasis()
 
 FLASHMEM void storeKeyboardScaleToEEPROM(byte c)
 {
-  EEPROM.update(EEPROM_KEYBOARD_SCALE, c);
+  eepromUpdateDeferred(EEPROM_KEYBOARD_SCALE, c);
 }
 
 FLASHMEM int8_t getKeyboardScale()
@@ -277,7 +330,7 @@ FLASHMEM int8_t getKeyboardScale()
 
 FLASHMEM void storeArpStyleToEEPROM(byte style)
 {
-  EEPROM.update(EEPROM_ARP_STYLE, style);
+  eepromUpdateDeferred(EEPROM_ARP_STYLE, style);
 }
 
 FLASHMEM void checkFirstRun()
@@ -306,6 +359,7 @@ FLASHMEM void checkFirstRun()
     storeKeyboardBasisToEEPROM(4);
     storeSendCCToEEPROM(0);
     storeSyncToMIDIClkToEEPROM(0);
+    storeSameVoiceRetrigToEEPROM(0);
     storeFirstRun();
   }
 }

@@ -24,6 +24,7 @@
 ------------------------------------------------
             ELECTROTECHNIQUE MOMENTUM
   Teensy MicroMod based Synthesizer - 12 voices
+  Firmware Rev 2.00
 ------------------------------------------------
 
   Arduino IDE Tools Settings:
@@ -59,6 +60,10 @@
 #include <MIDI.h>
 #include <USBHost_t36.h>
 #include <TeensyThreads.h>
+#include "ThreadSafety.h"
+
+// Momentum's audio code works with blocks of any multiple of 16 samples (64 or 128)
+static_assert(AUDIO_BLOCK_SAMPLES % 16 == 0 && AUDIO_BLOCK_SAMPLES >= 32, "AUDIO_BLOCK_SAMPLES must be a multiple of 16");
 #include <TeensyTimerTool.h>
 using namespace TeensyTimerTool;
 #include "MidiCC.h"
@@ -73,6 +78,9 @@ volatile boolean sdCardInterrupt = false;
 boolean usbHostPluggedIn = false;
 elapsedMillis usb_host_wait_timer;
 boolean MIDIClkSignal = false;
+// MIDI clock counts as lost after this long without a tick (24ppq at 20bpm is 125ms per tick)
+#define MIDI_CLOCK_TIMEOUT_MS 500
+elapsedMillis sinceMidiClock;
 
 State state = State::MAIN;
 boolean keyboardActive = false;
@@ -128,7 +136,7 @@ FLASHMEM void recallPatch(uint8_t bank, long patchUID);
 FLASHMEM void recallPerformance(uint8_t filename);
 FLASHMEM void myControlChange(byte channel, byte control, byte value);
 FLASHMEM void usbHostControlChange(byte channel, byte control, byte value);
-FLASHMEM void myMIDIClock();
+void myMIDIClock();
 FLASHMEM void myMIDIClockContinue();
 FLASHMEM void myMIDIClockStart();
 FLASHMEM void myMIDIClockStop();
@@ -143,6 +151,7 @@ void buttonCallback(unsigned button_idx, int state);
 
 #include "Display.h"
 #include "Settings.h"
+#include "FirmwareUpdate.h"
 
 boolean firstPatchLoaded = false;
 
@@ -150,11 +159,33 @@ uint32_t previousMillis = millis(); // For MIDI Clk Sync
 uint32_t timeNow = millis();        // For MIDI Clk Sync
 
 uint8_t midiClkCount = 0;    // For MIDI Clk Sync
+uint32_t midiBeatCount = 0;      // MIDI clock beats since Start
+uint32_t midiLastBeatMicros = 0; // time of the last beat
 uint8_t midiClkArpCount = 0; // For MIDI Clk Sync with Arp
 int voiceToReturn = -1;      // Initialise
 
 uint8_t seq_last_step = 0;
 uint8_t loopCount = 0;
+#define MIDI_READS_PER_LOOP 16 // Max pending messages handled per MIDI input each time they're read
+// Set while flushing MIDI input on Panic: incoming messages are read and dropped
+volatile boolean midiDiscard = false;
+
+// Blocks the audio update while note changes are applied, so envelope triggers and pitch
+// changes land in the same audio block. Safe to nest: the audio interrupt is only re-enabled
+// if it was enabled on entry.
+class AudioUpdateLock
+{
+public:
+    AudioUpdateLock() : wasEnabled(NVIC_IS_ENABLED(IRQ_SOFTWARE)) { NVIC_DISABLE_IRQ(IRQ_SOFTWARE); }
+    ~AudioUpdateLock()
+    {
+        if (wasEnabled)
+            NVIC_ENABLE_IRQ(IRQ_SOFTWARE);
+    }
+
+private:
+    const bool wasEnabled;
+};
 
 FLASHMEM void setup()
 {
@@ -291,16 +322,24 @@ FLASHMEM void setup()
     keyboardOct = getKeyboardBasis();
     sendCC = getSendCC();
     syncToMIDIClk = getSyncToMIDIClk();
+    // Read note retrigger mode from EEPROM
+    groupvec[activeGroupIndex]->setSameVoiceRetrig(getSameVoiceRetrig());
+    // If the audio processing ever overruns, drop a voice rather than hang
+    global.cpuGuard.onOverload = []()
+    { groupvec[activeGroupIndex]->shedVoice(); };
 
     assignStrings();
     assignParametersForPerformanceEncoders();
     setupDisplay();
     setEncodersState(state);
     setupHardware(encoderCallback, encoderButtonCallback, buttonCallback);
+    // Firmware update file on the SD card?
+    checkFirmwareFile();
 }
 
 // Specifically for Sequencer, bypassing recording note in and arp
-FLASHMEM void noteOn(byte channel, byte note, byte velocity)
+// Note handlers run from RAM: flash cache misses add latency/jitter (also called by the sequencer/arp)
+void noteOn(byte channel, byte note, byte velocity)
 {
     // Check for out of range notes. Less than 20Hz isn't really audible
     if (note + groupvec[activeGroupIndex]->params().oscPitchA < 10 ||
@@ -308,78 +347,54 @@ FLASHMEM void noteOn(byte channel, byte note, byte velocity)
         note + groupvec[activeGroupIndex]->params().oscPitchB < 10 ||
         note + groupvec[activeGroupIndex]->params().oscPitchB > 127)
         return;
+    AudioUpdateLock lock;
     groupvec[activeGroupIndex]->noteOn(note, velocity);
 }
 
-FLASHMEM void myNoteOn(byte channel, byte note, byte velocity)
+// Internal clock: a new arpeggio starts on the key press, instead of waiting up to a whole
+// division for the timer's next step. On MIDI clock it stays on the clock's grid.
+void arpStartNow()
 {
+    if (seqMidiSync || !currentSequence.running)
+        return;
+    if (!seqSwapper)
+        noteOffRoutine(); // The previous arpeggio's last note is still on
+    sequencer_timer.start();                                 // Restart the step period from now
+    sequencer_timer.setPeriod(currentSequence.tempo_us / 2); // and apply any pending tempo change
+    noteOnRoutine();
+}
+
+void myNoteOn(byte channel, byte note, byte velocity)
+{
+    if (midiDiscard)
+        return; // Panic is flushing the MIDI inputs
+    // Seed random() (Random arp style) from the CPU cycle count at the first key press, so
+    // it doesn't play the same sequence after every power-up
+    static bool randomSeeded = false;
+    if (!randomSeeded)
+    {
+        randomSeed(ARM_DWT_CYCCNT | 1);
+        randomSeeded = true;
+    }
     if (arpRunning)
     {
         // If it's in hold mode and you are not holding any notes down,
         // it continues to play the previous arpeggio. Once you press
         // a new note, it resets the arpeggio and starts a new one.
         // Also resets arpeggio from starting note.
-        if (arpNotesHeld == 0)
-        {
+        bool newArpeggio = arpNotesHeld == 0;
+        if (newArpeggio)
             resetNotes();
-            // if (getNotesInArp() == 0)
-            // {
-            //     noteOn(midiChannel, note, velocity);
-            //     setSeqTimerPeriod(currentSequence.bpm);
-            //     sequencerStart();
-            // }
-        }
-        if (arpNotesHeld < sizeof(arpNotes) - 1)
-            arpNotesHeld++;
-        else
-            return;
-
-        if (seqMidiSync && arpNotesHeld == 0)
-            midiClkArpCount = 0;
-
-        // find the right place to insert the note in the notes array
-        if (arpStyle == PLAYORDER)
-        {
-            for (uint8_t i = 0; i < sizeof(arpNotes); i++)
-            {
-                if (arpNotes[i] == note)
-                    return; // already in arpeggio
-                else if (arpNotes[i] != '\0')
-                    continue;
-                else
-                {
-                    arpNotes[i] = note;
-                    arpVels[i] = velocity;
-                    return;
-                }
-            }
-        }
-        else
-        {
-            for (uint8_t i = 0; i < sizeof(arpNotes); i++)
-            {
-                if (arpNotes[i] == note)
-                    return; // already in arpeggio
-                else if (arpNotes[i] != '\0' && arpNotes[i] < note)
-                    continue; // ignore the notes below it
-                else
-                {
-                    // once we reach the first note in the arpeggio that's higher
-                    // than the new one, move the rest of the arpeggio array over
-                    // to the right
-                    for (uint8_t j = sizeof(arpNotes) - 1; j > i; j--)
-                    {
-                        arpNotes[j] = arpNotes[j - 1];
-                        arpVels[j] = arpVels[j - 1];
-                    }
-
-                    // and insert the note
-                    arpNotes[i] = note;
-                    arpVels[i] = velocity;
-                    return;
-                }
-            }
-        }
+        if (isArpKeyHeld(note))
+            return; // Duplicate note-on (e.g. two merged MIDI sources)
+        if (arpNotesHeld >= sizeof(arpNotes) - 1)
+            return; // Arpeggio full
+        arpNotesHeld++;
+        setArpKeyHeld(note, true);
+        addArpNote(note, velocity);
+        if (newArpeggio)
+            arpStartNow();
+        return;
     }
     else
     {
@@ -405,35 +420,31 @@ FLASHMEM void myNoteOn(byte channel, byte note, byte velocity)
     }
 }
 
-FLASHMEM void noteOff(byte channel, byte note, byte velocity)
+void noteOff(byte channel, byte note, byte velocity)
 {
+    AudioUpdateLock lock;
     groupvec[activeGroupIndex]->noteOff(note);
 }
 
-FLASHMEM void myNoteOff(byte channel, byte note, byte velocity)
+void myNoteOff(byte channel, byte note, byte velocity)
 {
-    if (arpRunning)
+    if (midiDiscard)
+        return; // Panic is flushing the MIDI inputs
+    // Only keys the arp counted: not ones held before it started or rejected when it was full
+    if (arpRunning && isArpKeyHeld(note))
     {
+        setArpKeyHeld(note, false);
         if (arpNotesHeld > 0)
             arpNotesHeld--;
-
-        arpNotes[sizeof(arpNotes) - 1] = '\0';
-        for (uint8_t i = 0; i < sizeof(arpNotes) - 1; i++)
-        {
-            // note released
-            if (!arpHold && arpNotes[i] >= note)
-            {
-                // shift all notes in the array beyond or equal to the
-                // note in question, thereby removing it and keeping
-                // the array compact.
-                arpNotes[i] = arpNotes[i + 1];
-                arpVels[i] = arpVels[i + 1];
-            }
-        }
-        // if (arpNotesHeld == 0 && getNotesInArp() == 0)
-        //     sequencerStop();
+        // Remove exactly the released note (the old shift-based removal assumed a sorted
+        // arpeggio, so it removed the wrong note in Play Order)
+        if (!arpHold)
+            removeArpNote(note);
+        // The arp plays its own notes: this key never sounded, and a note-off here cut
+        // off an arp note of the same pitch
+        return;
     }
-    noteOff(channel, note, velocity);
+    noteOff(channel, note, velocity); // Includes keys held before the arp started
 }
 
 FLASHMEM void updatePatchnameAndIndex(String name, uint32_t index, uint32_t UID)
@@ -444,14 +455,19 @@ FLASHMEM void updatePatchnameAndIndex(String name, uint32_t index, uint32_t UID)
     setPatchNoAndNameForDisp(String(index), name);
 }
 
-FLASHMEM void myPitchBend(byte channel, int bend)
+void myPitchBend(byte channel, int bend)
 {
+    if (midiDiscard)
+        return; // Panic is flushing the MIDI inputs
     groupvec[activeGroupIndex]->pitchBend(bend * currentPatch.PitchBend * DIV12xDIV8192);
 }
 
 // MIDI CC
 FLASHMEM void myControlChange(byte channel, byte control, byte value)
 {
+    if (midiDiscard)
+        return; // Panic is flushing the MIDI inputs
+    LockGuard lock(displayLock); // The display renders from the state changed here
     if (DEBUG)
         Serial.printf("Ch:%u: cc=%d, v=%d\n", channel, control, value);
     if (sendCC)
@@ -462,7 +478,9 @@ FLASHMEM void myControlChange(byte channel, byte control, byte value)
     case CCvolume:
         currentVolume = value;
         storeVolumeToEEPROM(value);
-        groupvec[activeGroupIndex]->setVolume(LINEAR[currentVolume] * MAX_VOL);
+        // Audio taper: level = knob^2, so half way is -12dB rather than -6dB (most of the
+        // change used to be in the bottom fifth of the travel). Maximum is unchanged.
+        groupvec[activeGroupIndex]->setVolume(LINEAR[currentVolume] * LINEAR[currentVolume] * MAX_VOL);
         showCurrentParameterOverlay(ParameterStrMap[CCvolume], LINEAR[currentVolume]);
         break;
     case CCunison:
@@ -537,20 +555,23 @@ FLASHMEM void myControlChange(byte channel, byte control, byte value)
 
     case CCdetune:
     {
-        float detune = 1.0f - (MAXDETUNE * POWER[value]);
-        groupvec[activeGroupIndex]->params().detune = detune;
-        groupvec[activeGroupIndex]->params().chordDetune = value;
-        groupvec[activeGroupIndex]->updateVoices();
-
+        // One control for two values: the chord in Chord unison mode, otherwise the detune.
+        // Only the one the mode uses is changed (it used to set both, so a detune change -
+        // including the one made when a patch is loaded - replaced the stored chord: GitHub #13)
         if (groupvec[activeGroupIndex]->params().unisonMode == 2) // Chord Detune
         {
             currentPatch.ChordDetune = value;
+            groupvec[activeGroupIndex]->params().chordDetune = value;
+            groupvec[activeGroupIndex]->updateVoices();
             if (!setEncValue(CCdetune, value, CDT_STR[value]))
                 showCurrentParameterOverlay(F("Chord"), CDT_STR[value]);
         }
         else
         {
+            float detune = 1.0f - (MAXDETUNE * POWER[value]);
             currentPatch.Detune = value;
+            groupvec[activeGroupIndex]->params().detune = detune;
+            groupvec[activeGroupIndex]->updateVoices();
             if (!setEncValue(CCdetune, value, String((1 - detune) * 100) + F("%")))
                 showCurrentParameterOverlay(ParameterStrMap[CCdetune], String((1 - detune) * 100) + F("%"));
         }
@@ -828,27 +849,7 @@ FLASHMEM void myControlChange(byte channel, byte control, byte value)
         currentPatch.FilterMixer = value;
         groupvec[activeGroupIndex]->setFilterMixer(LINEAR_FILTERMIXER[value]);
 
-        String filterStr;
-        if (LINEAR_FILTERMIXER[value] == BANDPASS)
-        {
-            filterStr = F("Band Pass");
-        }
-        else
-        {
-            // LP-HP mix mode - a notch filter
-            if (LINEAR_FILTERMIXER[value] == LOWPASS)
-            {
-                filterStr = F("Low Pass");
-            }
-            else if (LINEAR_FILTERMIXER[value] == HIGHPASS)
-            {
-                filterStr = F("High Pass");
-            }
-            else
-            {
-                filterStr = F("Low ") + String(100 - int(100 * LINEAR_FILTERMIXER[value])) + F(" - ") + String(int(100 * LINEAR_FILTERMIXER[value])) + F(" High");
-            }
-        }
+        String filterStr = filterMixerStr(LINEAR_FILTERMIXER[value]);
         if (!setEncValue(CCfiltermixer, value, filterStr))
             showCurrentParameterOverlay(ParameterStrMap[CCfiltermixer], filterStr);
 
@@ -1103,6 +1104,44 @@ FLASHMEM void myControlChange(byte channel, byte control, byte value)
         if (!setEncValue(CCreverbfxmix, value, String(LINEAR[value])))
             showCurrentParameterOverlay(ParameterStrMap[CCreverbfxmix], String(LINEAR[value]));
         break;
+    case CCensemblefxdepth:
+    {
+        currentPatch.EnsembleEffectDepth = value;
+        groupvec[activeGroupIndex]->setEnsembleEffectDepth(ensembleDepth(value)); // 64 = original
+        String str = String(int(ensembleDepth(value) * 100 + 0.5f)) + F("%");
+        if (!setEncValue(CCensemblefxdepth, value, str))
+            showCurrentParameterOverlay(ParameterStrMap[CCensemblefxdepth], str);
+        // The depth sets the shortest delay, so the delay shown can change too
+        setEncValue(CCensemblefxdelay, currentPatch.EnsembleEffectDelay, ensembleDelayStr());
+        break;
+    }
+    case CCensemblefxdelay:
+    {
+        currentPatch.EnsembleEffectDelay = value;
+        groupvec[activeGroupIndex]->setEnsembleEffectDelay(ensembleDelaySamples(value)); // 64 = original
+        String str = ensembleDelayStr();
+        if (!setEncValue(CCensemblefxdelay, value, str))
+            showCurrentParameterOverlay(ParameterStrMap[CCensemblefxdelay], str);
+        break;
+    }
+    case CCreverbfxdamping:
+    {
+        currentPatch.ReverbEffectDamping = value;
+        groupvec[activeGroupIndex]->setReverbEffectDamping(value / 128.0f);
+        String str = String(int(value * 100 / 128.0f + 0.5f)) + F("%");
+        if (!setEncValue(CCreverbfxdamping, value, str))
+            showCurrentParameterOverlay(ParameterStrMap[CCreverbfxdamping], str);
+        break;
+    }
+    case CCreverbfxbasscut:
+    {
+        currentPatch.ReverbEffectBassCut = value;
+        groupvec[activeGroupIndex]->setReverbEffectBassCut(value / 128.0f);
+        String str = String(int(value * 100 / 128.0f + 0.5f)) + F("%");
+        if (!setEncValue(CCreverbfxbasscut, value, str))
+            showCurrentParameterOverlay(ParameterStrMap[CCreverbfxbasscut], str);
+        break;
+    }
     case CCallnotesoff:
         groupvec[activeGroupIndex]->allNotesOff();
         break;
@@ -1203,6 +1242,9 @@ FLASHMEM void myControlChange(byte channel, byte control, byte value)
 
 FLASHMEM void myProgramChange(byte channel, byte program)
 {
+    if (midiDiscard)
+        return; // Panic is flushing the MIDI inputs
+    LockGuard lock(displayLock); // The display renders from the state changed here
     if (state == State::PERFORMANCEPAGE || state == State::PERFORMANCERECALL)
     {
         if (program < PERFORMANCES_LIMIT)
@@ -1280,28 +1322,69 @@ FLASHMEM void sequencerStop()
     currentSequence.note_in = 0;
 }
 
+// The arp carries on with its own timer when MIDI clock stops or is lost
+FLASHMEM void arpToInternalClock()
+{
+    if (arpRunning && !seqMidiSync)
+    {
+        midiClkArpCount = 0;
+        sequencerStart(); // Starts the internal timer, as seqMidiSync is false
+    }
+}
+
+// MIDI Stop, or the clock was lost (see loop()). seqMidiSync is only ever set while
+// "sync to MIDI clock" is on, and is cleared here so the internal clock works again.
+FLASHMEM void midiClockStopped()
+{
+    bool wasSynced = seqMidiSync;
+    if (seqMidiSync)
+    {
+        sequencerStop();
+        groupvec[activeGroupIndex]->allNotesOff();
+        resetNotes();
+    }
+    seqMidiSync = false;
+    MIDIClkSignal = false;
+    if (wasSynced)
+        arpToInternalClock();
+}
+
 FLASHMEM void myMIDIClockContinue()
 {
+    if (midiDiscard)
+        return; // Panic is flushing the MIDI inputs
+    sinceMidiClock = 0;
+    if (!syncToMIDIClk)
+        return;
     if (!currentSequence.running)
     {
         seqMidiSync = true;
-        if (syncToMIDIClk)
-            sequencerStart(true);
+        sequencerStart(true);
     }
 }
 
 FLASHMEM void myMIDIClockStart()
 {
-    if ((!currentSequence.running && !seqMidiSync) || arpRunning)
-        seqMidiSync = true;
+    if (midiDiscard)
+        return; // Panic is flushing the MIDI inputs
     midiClkCount = 0;
-    if ((state == State::SEQUENCEPAGE || state == State::SEQUENCEEDIT) && seqMidiSync && syncToMIDIClk)
-        sequencerStart();
-    else if (arpRunning)
+    midiBeatCount = 0;
+    midiLastBeatMicros = micros();
+    sinceMidiClock = 0;
+    // Only follow the clock when "sync to MIDI clock" is on: the arp used to switch to it
+    // regardless, and was then left with no timer at all after a MIDI Stop
+    if (syncToMIDIClk)
     {
-        sequencer_timer.stop();
-        midiClkArpCount = 0;
-        seqSwapper = true;
+        if ((!currentSequence.running && !seqMidiSync) || arpRunning)
+            seqMidiSync = true;
+        if ((state == State::SEQUENCEPAGE || state == State::SEQUENCEEDIT) && seqMidiSync)
+            sequencerStart();
+        else if (arpRunning)
+        {
+            sequencer_timer.stop();
+            midiClkArpCount = 0;
+            seqSwapper = true;
+        }
     }
     // Resync LFOs when MIDI Clock starts.
     // When there's a jump to a different
@@ -1315,55 +1398,65 @@ FLASHMEM void myMIDIClockStart()
 
 FLASHMEM void myMIDIClockStop()
 {
-    if (seqMidiSync && syncToMIDIClk)
-    {
-        sequencerStop();
-        groupvec[activeGroupIndex]->allNotesOff();
-        resetNotes();
-    }
-    seqMidiSync = false;
-    MIDIClkSignal = false;
+    if (midiDiscard)
+        return; // Panic is flushing the MIDI inputs
+    midiClockStopped();
 }
 
-FLASHMEM void myMIDIClock()
+void myMIDIClock()
 {
+    if (midiDiscard)
+        return; // Panic is flushing the MIDI inputs
+    sinceMidiClock = 0;
     MIDIClkSignal = true;
+    if (seqMidiSync && !syncToMIDIClk)
+        midiClockStopped(); // "Sync to MIDI clock" turned off while following the clock
     // 24ppq this is for 4/4 time, alternates between noteon and noteoff, 8 times
     if (seqMidiSync && syncToMIDIClk && currentSequence.running && (midiClkCount % 3) == 0)
     {
         sequencer();
         if (state == SEQUENCEPAGE || state == SEQUENCEEDIT || state == ARPPAGE1 || state == ARPPAGE2)
-            setEncValue(SeqTempo, lfoSyncFreq * 60, String(lfoSyncFreq * 60, 1));
+            setEncValue(SeqTempo, bpmToEncValue(lfoSyncFreq * 60), String(lfoSyncFreq * 60, 1));
     }
 
     if (seqMidiSync && arpRunning)
     {
-        if (midiClkArpCount == 0 && seqSwapper)
+        const uint8_t division = ARP_DIVISION_24PPQ[arpDivision];
+        // The division can be shortened while running: the count used to run on to 255
+        // (seconds of silence, with the last note left on)
+        if (midiClkArpCount >= division)
+            midiClkArpCount = 0;
+        if (midiClkArpCount == 0)
         {
+            if (!seqSwapper)
+                noteOffRoutine(); // Note-off was skipped by a division change
             noteOnRoutine();
         }
-        else if (midiClkArpCount == (ARP_DIVISION_24PPQ[arpDivision] - 2) && !seqSwapper)
+        else if (midiClkArpCount == division - 2 && !seqSwapper)
         {
             noteOffRoutine();
-            // if(DEBUG) Serial.printf("MIDIClk %d: %d", midiClkArpCount, ARP_DIVISION_24PPQ[arpDivision]);
         }
 
-        if ((midiClkArpCount + 1) == ARP_DIVISION_24PPQ[arpDivision])
+        if (++midiClkArpCount >= division)
             midiClkArpCount = 0;
-        else
-            midiClkArpCount++;
     }
 
-    // This recalculates the LFO frequencies if the tempo changes (MIDI cLock is 24ppq)
-    // At 120bpm, a quarter note is every 500ms, 24ppq may have an error of 20ms giving an error in calculated bpm of up to 5bpm
+    // Every beat (24 clocks): the tempo is measured in microseconds (was milliseconds) and
+    // synced LFOs are kept in phase with the beat count since Start (they used to only get
+    // the rate, so they kept an arbitrary offset and drifted against the music)
     if (++midiClkCount > 23)
     {
         // TODO: Multitimbral Most of this needs to move into the VoiceGroup
-        timeNow = millis();
-        lfoSyncFreq = 1000.0f / (timeNow - previousMillis);
-        previousMillis = timeNow;
-        groupvec[activeGroupIndex]->filterMidiClock(lfoSyncFreq * lfoFilterTempoValue);
-        groupvec[activeGroupIndex]->pitchMidiClock(lfoSyncFreq * lfoPitchTempoValue);
+        const uint32_t now = micros();
+        const uint32_t beatMicros = now - midiLastBeatMicros;
+        const bool haveTempo = midiLastBeatMicros != 0 && beatMicros > 0 && beatMicros < 4000000; // 15bpm and up
+        midiLastBeatMicros = now;
+        midiBeatCount++;
+        if (haveTempo)
+        {
+            lfoSyncFreq = 1000000.0f / beatMicros;
+            groupvec[activeGroupIndex]->midiClockBeat(midiBeatCount, beatMicros * 0.000001f);
+        }
         midiClkCount = 0;
     }
 }
@@ -1374,8 +1467,16 @@ FLASHMEM void silence()
     groupvec[activeGroupIndex]->closeEnvelopes();
 }
 
+// Debounced patch recall, see selectPatchForRecall()
+#define PATCH_RECALL_DELAY_MS 150
+boolean patchRecallPending = false;
+boolean patchRecallUpdatesPerformance = false;
+elapsedMillis patchRecallTimer;
+
 FLASHMEM void recallPatch(uint8_t bank, long patchUID)
 {
+    LockGuard lock(displayLock); // The display renders from the state changed here
+    patchRecallPending = false;  // A direct recall replaces a pending one
     if (patchUID == 0)
         return;
     silence();
@@ -1394,8 +1495,36 @@ FLASHMEM void recallPatch(uint8_t bank, long patchUID)
     }
 }
 
+// Turning the patch or bank encoder only selects and shows the patch. It is recalled once the
+// encoder has been still for PATCH_RECALL_DELAY_MS, rather than on every detent: each recall
+// reads the SD card, sets every parameter and writes EEPROM, which a fast turn did dozens of
+// times a second (freezes on TSynth).
+FLASHMEM void selectPatchForRecall(boolean updatePerformance)
+{
+    setPatchNoAndNameForDisp(String(currentPatchIndex + 1), patches[currentPatchIndex].patchName);
+    patchRecallPending = true;
+    patchRecallUpdatesPerformance = updatePerformance;
+    patchRecallTimer = 0;
+}
+
+FLASHMEM void checkPendingPatchRecall()
+{
+    if (!patchRecallPending || patchRecallTimer < PATCH_RECALL_DELAY_MS)
+        return;
+    LockGuard lock(displayLock);
+    patchRecallPending = false;
+    recallPatch(currentBankIndex, patches[currentPatchIndex].patchUID);
+    if (patchRecallUpdatesPerformance)
+    {
+        currentPerformance.patches[0].bankIndex = currentBankIndex;
+        currentPerformance.patches[0].UID = patches[currentPatchIndex].patchUID;
+        currentPerformance.patches[0].patchName = currentPatchName;
+    }
+}
+
 FLASHMEM void recallPerformance(uint8_t filename)
 {
+    LockGuard lock(displayLock); // The display renders from the state changed here
     silence();
     if (loadPerformance(filename))
     {
@@ -1437,6 +1566,7 @@ FLASHMEM void recallPerformance(uint8_t filename)
 
 FLASHMEM void recallSequence(uint8_t filename)
 {
+    LockGuard lock(displayLock); // The display renders from the state changed here
     silence();
     if (!loadSequence(filename))
     {
@@ -1459,9 +1589,13 @@ FLASHMEM void setCurrentPatchData()
     myControlChange(midiChannel, CCoscLevelA, currentPatch.OscLevelA);
     myControlChange(midiChannel, CCoscLevelB, currentPatch.OscLevelB);
     myControlChange(midiChannel, CCnoiseLevel, currentPatch.NoiseLevel);
+    // Both detune values, whatever the unison mode (CCdetune sets only the one the mode
+    // uses). Before the unison mode, so the detune shown for the mode is this patch's
+    groupvec[activeGroupIndex]->params().detune = 1.0f - (MAXDETUNE * POWER[currentPatch.Detune]);
+    groupvec[activeGroupIndex]->params().chordDetune = currentPatch.ChordDetune;
+    groupvec[activeGroupIndex]->updateVoices();
     myControlChange(midiChannel, CCunison, currentPatch.Unison);
     myControlChange(midiChannel, CCoscfx, currentPatch.OscFX);
-    myControlChange(midiChannel, CCdetune, currentPatch.Detune);
     myControlChange(midiChannel, CCoscLfoRate, currentPatch.PitchLFORate);
     myControlChange(midiChannel, CCkeytracking, currentPatch.KeyTracking);
     myControlChange(midiChannel, CCglide, currentPatch.Glide);
@@ -1503,6 +1637,10 @@ FLASHMEM void setCurrentPatchData()
     myControlChange(midiChannel, CCensemblefxmix, currentPatch.EnsembleEffectMix);
     myControlChange(midiChannel, CCreverbfxtime, currentPatch.ReverbEffectTime);
     myControlChange(midiChannel, CCreverbfxmix, currentPatch.ReverbEffectMix);
+    myControlChange(midiChannel, CCensemblefxdepth, currentPatch.EnsembleEffectDepth);
+    myControlChange(midiChannel, CCensemblefxdelay, currentPatch.EnsembleEffectDelay);
+    myControlChange(midiChannel, CCreverbfxdamping, currentPatch.ReverbEffectDamping);
+    myControlChange(midiChannel, CCreverbfxbasscut, currentPatch.ReverbEffectBassCut);
     myControlChange(midiChannel, CCpitchenv, currentPatch.PitchEnv);
     myControlChange(midiChannel, CCvelocitySens, currentPatch.VelocitySensitivity);
     myControlChange(midiChannel, pitchmodwheeldepth, currentPatch.PitchModWheelDepth);
@@ -1589,6 +1727,7 @@ FLASHMEM int8_t encScaling(EncoderMappingStruct *enc, int8_t delta)
 
 FLASHMEM void encoderCallback(unsigned enc_idx, int value, int delta)
 {
+    LockGuard lock(displayLock); // The display renders from the state changed here
     // --- Value isn't used because it's absolute values that don't change with changes to the encoder assignment---
     if (DEBUG)
         Serial.printf("enc[%u]: v=%d, d=%d\n", enc_idx, value, delta);
@@ -1626,7 +1765,7 @@ FLASHMEM void encoderCallback(unsigned enc_idx, int value, int delta)
             newDelta > 0 ? incCurrentPatchIndex() : decCurrentPatchIndex();
             if (state == State::MAIN || state == State::DELETEPATCH)
             {
-                recallPatch(currentBankIndex, patches[currentPatchIndex].patchUID);
+                selectPatchForRecall(false);
             }
             else if (state == State::PATCHSAVING)
             {
@@ -1634,10 +1773,7 @@ FLASHMEM void encoderCallback(unsigned enc_idx, int value, int delta)
             }
             else if (state == State::PERFORMANCEPATCHEDIT)
             {
-                recallPatch(currentBankIndex, patches[currentPatchIndex].patchUID);
-                currentPerformance.patches[0].bankIndex = currentBankIndex;
-                currentPerformance.patches[0].UID = patches[currentPatchIndex].patchUID;
-                currentPerformance.patches[0].patchName = currentPatchName;
+                selectPatchForRecall(true);
             }
             break;
         case CCbankselectLSB:
@@ -1655,7 +1791,7 @@ FLASHMEM void encoderCallback(unsigned enc_idx, int value, int delta)
             {
                 currentBankIndex = tempBankIndex;
                 currentPatchIndex = patches.size() - 1;
-                recallPatch(currentBankIndex, patches[currentPatchIndex].patchUID);
+                selectPatchForRecall(false);
             }
             else
             {
@@ -1665,7 +1801,7 @@ FLASHMEM void encoderCallback(unsigned enc_idx, int value, int delta)
                 }
                 currentBankIndex = tempBankIndex;
                 currentPatchIndex = 0;
-                recallPatch(currentBankIndex, patches[currentPatchIndex].patchUID);
+                selectPatchForRecall(false);
             }
             break;
         case savebankselect:
@@ -1837,7 +1973,7 @@ FLASHMEM void encoderCallback(unsigned enc_idx, int value, int delta)
                 break;
             currentSequence.bpm += (newDelta / 10.0f);
             setSeqTimerPeriod(currentSequence.bpm);
-            setEncValue(SeqTempo, currentSequence.bpm, String(currentSequence.bpm, 1));
+            setEncValue(SeqTempo, bpmToEncValue(currentSequence.bpm), String(currentSequence.bpm, 1));
             break;
         case SeqLength:
             if (newDelta == 0 || currentSequence.length + newDelta < 1 || currentSequence.length + newDelta > 64)
@@ -1919,6 +2055,7 @@ FLASHMEM void encoderCallback(unsigned enc_idx, int value, int delta)
 
 FLASHMEM void encoderButtonCallback(unsigned enc_idx, int buttonState)
 {
+    LockGuard lock(displayLock); // The display renders from the state changed here
     // Subtract 4 from encoder index due to numbering on shift registers
     enc_idx -= 4;
 
@@ -1933,6 +2070,13 @@ FLASHMEM void encoderButtonCallback(unsigned enc_idx, int buttonState)
         case kbdOct:
         case kbdScale:
             keyboardActive = !keyboardActive;
+            break;
+        case firmwareupdate:
+            // Run from loop(): the update can't hold the display lock, or no progress is shown
+            firmwareUpdateRequested = true;
+            break;
+        case firmwarecancel:
+            renameFirmwareFile(fwFileName, FW_FILE_CANCELLED_EXT); // Not offered again until it's renamed back
             break;
         case patchselect:
         case CCbankselectLSB:
@@ -2103,7 +2247,7 @@ FLASHMEM void encoderButtonCallback(unsigned enc_idx, int buttonState)
             break;
         case savepatch:
             state = State::SAVE;
-            strncpy(currentPatch.PatchName, currentPatchName.c_str(), 64);
+            strlcpy(currentPatch.PatchName, currentPatchName.c_str(), sizeof(currentPatch.PatchName)); // Always terminated
             savePatch(currentBankIndex, currentPatchIndex);
             updatePatchnameAndIndex(currentPatch.PatchName, currentPatchIndex + 1, currentPatch.UID);
             recallPatch(currentBankIndex, patches[currentPatchIndex].patchUID);
@@ -2304,8 +2448,47 @@ FLASHMEM void encoderButtonCallback(unsigned enc_idx, int buttonState)
     }
 }
 
+// Reinitialise to panel: state shown for this long, then restored (see buttonCallback)
+#define REINIT_STATE_MS 250
+State reinitRestoreState = State::MAIN;
+bool reinitRestorePending = false;
+elapsedMillis reinitRestoreTimer;
+
+// Read and drop everything waiting in the MIDI inputs, so a backlog from a flood of MIDI
+// doesn't keep playing after Panic. Bounded in time in case the sender keeps going.
+#define MIDI_FLUSH_MAX_MS 50
+FLASHMEM void flushMidiInput()
+{
+    midiDiscard = true;
+    elapsedMillis t;
+    bool more = true;
+    while (more && t < MIDI_FLUSH_MAX_MS)
+    {
+        more = false;
+        myusb.Task();
+        if (usbHostMIDI.read()) // USB host
+            more = true;
+        if (usbMIDI.read()) // USB device
+            more = true;
+    }
+    // 5 pin DIN: drop the unread bytes without parsing them, so they aren't sent to MIDI thru
+    Serial1.clear();
+    midiDiscard = false;
+}
+
+// Panic: drop any MIDI waiting to be read, then silence all voices at once
+FLASHMEM void midiPanic()
+{
+    flushMidiInput();
+    AudioNoInterrupts();
+    groupvec[activeGroupIndex]->panic();
+    AudioInterrupts();
+    showCurrentParameterOverlay(F("Panic"), F("All notes off"));
+}
+
 FLASHMEM void buttonCallback(unsigned button_idx, int buttonStatus)
 {
+    LockGuard lock(displayLock); // The display renders from the state changed here
     /*
       Button1 SR1 D4  10
       Button2 SR2 D4  9
@@ -2823,8 +3006,8 @@ FLASHMEM void buttonCallback(unsigned button_idx, int buttonStatus)
                 return;
             if (state != State::FXPAGE1 && state != State::FXPAGE2)
             {
-                // If Back button held, Panic - all notes off
-                silence();
+                // If Back button held, Panic: drop any MIDI waiting to be read, then all notes off
+                midiPanic();
                 flashLED(GREEN, 6, 250);
             }
             else
@@ -2917,7 +3100,7 @@ FLASHMEM void buttonCallback(unsigned button_idx, int buttonStatus)
             {
                 // Save after patch naming
                 state = State::SAVE;
-                strncpy(currentPatch.PatchName, currentPatchName.c_str(), 64);
+                strlcpy(currentPatch.PatchName, currentPatchName.c_str(), sizeof(currentPatch.PatchName)); // Always terminated
                 savePatch(currentBankIndex, currentPatchIndex);
                 updatePatchnameAndIndex(currentPatch.PatchName, currentPatchIndex + 1, currentPatch.UID);
                 recallPatch(currentBankIndex, patches[currentPatchIndex].patchUID);
@@ -3008,12 +3191,15 @@ FLASHMEM void buttonCallback(unsigned button_idx, int buttonStatus)
             if (state != State::PATCHLIST)
             {
                 // Reinitialise to default patch
-                State prevState = state;
+                reinitRestoreState = state;
                 state = State::REINITIALISE;
                 reinitialisePatch();
                 setCurrentPatchData();
-                flashLED(GREEN, 8, 250);
-                state = prevState;
+                flashLED(GREEN, 8, REINIT_STATE_MS);
+                // The previous state comes back after REINIT_STATE_MS (from loop()), so the
+                // display shows the reinitialise message, without stopping the main loop
+                reinitRestorePending = true;
+                reinitRestoreTimer = 0;
             }
             else
             {
@@ -3052,6 +3238,7 @@ void midiCCOut(byte cc, byte value)
 
 FLASHMEM void sdCardDetect()
 {
+    LockGuard lock(displayLock); // The display renders from the state changed here
     if (sdCardInterrupt)
     {
         silence();
@@ -3130,9 +3317,120 @@ FLASHMEM void sequencerLEDs()
     }
 }
 
+// Audio CPU use by group of audio objects: current / max over the last second, in % of the
+// time available
+struct CpuGroup
+{
+    float now = 0, max = 0;
+    void add(AudioStream &s)
+    {
+        now += s.processorUsage();
+        max += s.processorUsageMax();
+        s.processorUsageMaxReset();
+    }
+    void print(const __FlashStringHelper *name)
+    {
+        Serial.print(F("  "));
+        Serial.print(name);
+        Serial.print(F(" "));
+        Serial.print(now, 1);
+        Serial.print(F("/"));
+        Serial.print(max, 1);
+    }
+};
+
 FLASHMEM void CPUMonitor()
 {
-    Serial.printf(" CPU:%f (%f)  MEM:%f\n", AudioProcessorUsage(), AudioProcessorUsageMax(), AudioMemoryUsageMax());
+    // Once a second: printing every loop floods USB serial and can stall the main loop
+    static elapsedMillis sincePrint;
+    if (sincePrint < 1000)
+        return;
+    sincePrint = 0;
+
+    CpuGroup cg_osc, cg_filt, cg_env, cg_vmix, cg_oscfx, cg_dc, cg_lfo, cg_smix, cg_ens, cg_dcf, cg_rev, cg_noise, cg_out;
+    for (uint8_t i = 0; i < global.maxVoices(); i++)
+    {
+        Patch &p = global.Oscillators[i];
+        cg_osc.add(p.waveformMod_a);
+        cg_osc.add(p.waveformMod_b);
+        cg_filt.add(p.filter_);
+        cg_env.add(p.ampEnvelope_);
+        cg_env.add(p.filterEnvelope_);
+        cg_vmix.add(p.pwMixer_a);
+        cg_vmix.add(p.pwMixer_b);
+        cg_vmix.add(p.oscModMixer_a);
+        cg_vmix.add(p.oscModMixer_b);
+        cg_vmix.add(p.waveformMixer_);
+        cg_vmix.add(p.filterModMixer_);
+        cg_oscfx.add(p.oscFX_);
+        cg_dc.add(p.glide_);
+        cg_dc.add(p.filterVelocity_);
+    }
+    PatchShared &s = global.SharedAudio[0];
+    cg_lfo.add(s.pitchLfo);
+    cg_lfo.add(s.pwmLfoA);
+    cg_lfo.add(s.pwmLfoB);
+    cg_lfo.add(s.filterLfo);
+    cg_lfo.add(s.pitchBend);
+    cg_lfo.add(s.pwa);
+    cg_lfo.add(s.pwb);
+    cg_smix.add(s.pitchMixer);
+    cg_smix.add(s.noiseMixer);
+    for (uint8_t i = 0; i < 3; i++)
+        cg_smix.add(s.voiceMixer[i]);
+    cg_smix.add(s.voiceMixerM);
+    cg_smix.add(s.volumeMixer);
+    cg_smix.add(s.ensembleEffectMixerL);
+    cg_smix.add(s.ensembleEffectMixerR);
+    cg_ens.add(s.ensemble);
+    cg_dcf.add(s.dcOffsetFilter);
+    cg_rev.add(global.reverb);
+    cg_noise.add(global.pink);
+    cg_noise.add(global.white);
+    cg_out.add(global.i2s);
+    cg_out.add(global.usbAudio);
+    cg_out.add(global.peak);
+    cg_out.add(global.scope);
+    cg_out.add(global.cpuGuard);
+    cg_out.add(global.constant1Dc);
+    for (uint8_t i = 0; i < 3; i++)
+    {
+        cg_out.add(global.ensembleEffectMixerL[i]);
+        cg_out.add(global.ensembleEffectMixerR[i]);
+    }
+    cg_out.add(global.effectMixerLM);
+    cg_out.add(global.effectMixerRM);
+
+    // Memory is in audio blocks, out of the AudioMemory() allocation in setup().
+    // Stack is the most the display thread has used, out of DISPLAY_THREAD_STACK.
+    Serial.printf("CPU %.1f/%.1f%%  MEM %u/%u  Display stack %u/%u |", AudioProcessorUsage(), AudioProcessorUsageMax(),
+                  (unsigned)AudioMemoryUsage(), (unsigned)AudioMemoryUsageMax(), (unsigned)displayStackUsed(), (unsigned)DISPLAY_THREAD_STACK);
+    cg_osc.print(F("osc"));
+    cg_filt.print(F("filter"));
+    cg_env.print(F("env"));
+    cg_vmix.print(F("vmix"));
+    cg_oscfx.print(F("oscfx"));
+    cg_dc.print(F("dc"));
+    cg_lfo.print(F("lfo"));
+    cg_smix.print(F("smix"));
+    cg_ens.print(F("ensemble"));
+    cg_dcf.print(F("dcfilt"));
+    cg_rev.print(F("reverb"));
+    cg_noise.print(F("noise"));
+    cg_out.print(F("out"));
+    Serial.println();
+    AudioProcessorUsageMaxReset();
+}
+
+// Prints the details of the last crash (if any) once the Serial Monitor is connected
+FLASHMEM void crashReportCheck()
+{
+    static bool checked = false;
+    if (checked || !Serial)
+        return;
+    checked = true;
+    if (CrashReport)
+        Serial.print(CrashReport);
 }
 
 void loop()
@@ -3141,18 +3439,52 @@ void loop()
     if (loopCount++ > 15)
     {
         checkUSBHostStatus();
+        // Drain pending MIDI messages (bounded) so notes aren't queued behind clock/CC traffic.
+        // read() returns false straight away when nothing is waiting.
         // USB Host MIDI Class Compliant
-        usbHostMIDI.read(midiChannel);
+        for (uint8_t i = 0; i < MIDI_READS_PER_LOOP && usbHostMIDI.read(midiChannel); i++)
+            ;
         // USB Client MIDI
-        usbMIDI.read(midiChannel);
+        for (uint8_t i = 0; i < MIDI_READS_PER_LOOP && usbMIDI.read(midiChannel); i++)
+            ;
         // MIDI 5 Pin DIN
-        MIDI.read(midiChannel);
+        for (uint8_t i = 0; i < MIDI_READS_PER_LOOP && MIDI.read(midiChannel); i++)
+            ;
         sdCardDetect();
         sequencerLEDs();
-        // if (DEBUG)
-        //     CPUMonitor();
+        // MIDI clock lost without a Stop (cable pulled, DAW closed): stop following it,
+        // otherwise the sequencer waits for it for ever
+        if (MIDIClkSignal && sinceMidiClock > MIDI_CLOCK_TIMEOUT_MS)
+        {
+            if (seqMidiSync)
+                midiClockStopped();
+            else
+                MIDIClkSignal = false;
+        }
+        crashReportCheck();
+        eepromFlushDeferred(); // Settings that were changing, once they've been still
+        serviceLEDFlash();
+        if (reinitRestorePending && reinitRestoreTimer >= REINIT_STATE_MS)
+        {
+            reinitRestorePending = false;
+            if (state == State::REINITIALISE)
+                state = reinitRestoreState;
+        }
+        // Uncomment for CPU (total and by group), audio memory and display stack, once a second
+        // CPUMonitor();
         loopCount = 0;
     }
     encoders.read();
     buttons.read();
+    // Start note-ons that were waiting for a stolen voice to fade out, and suspend the
+    // oscillators of voices that have stopped sounding
+    groupvec[activeGroupIndex]->serviceVoices();
+    checkPendingPatchRecall();
+    serviceFirmwareUpdate();
+    static uint32_t overloadsReported = 0;
+    if (global.cpuGuard.overloads != overloadsReported)
+    {
+        overloadsReported = global.cpuGuard.overloads;
+        Serial.println(F("Audio CPU overload: a voice was dropped"));
+    }
 }

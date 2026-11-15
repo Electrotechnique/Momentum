@@ -53,7 +53,7 @@ extern void myNoteOff(byte channel, byte note, byte velocity);
 extern void noteOff(byte channel, byte note, byte velocity);
 extern void noteOn(byte channel, byte note, byte velocity);
 
-FLASHMEM void noteOffRoutine();
+void noteOffRoutine();
 
 uint8_t currentSeqPosition = 0; // 1.1.1
 uint8_t currentSeqNote = 60;    // C3
@@ -82,6 +82,63 @@ uint8_t playingArpRange = 3;
 int8_t currentArpOct = 0;
 int8_t arpPlayCount = 0;
 boolean upDownExtraNote = false;
+// Keys counted in arpNotesHeld, one bit per MIDI note. Note-offs are matched against this, so
+// duplicate note-ons, keys held before the arp started and keys rejected when it was full
+// don't upset the count or remove other notes.
+uint32_t arpKeysHeld[4] = {0, 0, 0, 0};
+
+inline bool isArpKeyHeld(uint8_t note)
+{
+    return arpKeysHeld[(note >> 5) & 3] & (1u << (note & 31));
+}
+
+inline void setArpKeyHeld(uint8_t note, bool held)
+{
+    if (held)
+        arpKeysHeld[(note >> 5) & 3] |= (1u << (note & 31));
+    else
+        arpKeysHeld[(note >> 5) & 3] &= ~(1u << (note & 31));
+}
+
+// Adds a note to the arpeggio: in the order played for Play Order, otherwise sorted low to high.
+// The caller checks there's room (at most sizeof(arpNotes) - 1 notes, so the list stays terminated).
+void addArpNote(uint8_t note, uint8_t velocity)
+{
+    for (uint8_t i = 0; i < sizeof(arpNotes); i++)
+    {
+        if (arpNotes[i] == note)
+            return; // already in arpeggio (latched in Hold mode)
+        if (arpNotes[i] != '\0' && (arpStyle == PLAYORDER || arpNotes[i] < note))
+            continue;
+        // Insert here, moving the notes above it up one place
+        for (uint8_t j = sizeof(arpNotes) - 1; j > i; j--)
+        {
+            arpNotes[j] = arpNotes[j - 1];
+            arpVels[j] = arpVels[j - 1];
+        }
+        arpNotes[i] = note;
+        arpVels[i] = velocity;
+        return;
+    }
+}
+
+// Removes one note from the arpeggio, keeping the order of the others (sorted or play order)
+FLASHMEM void removeArpNote(uint8_t note)
+{
+    for (uint8_t i = 0; i < sizeof(arpNotes) && arpNotes[i] != '\0'; i++)
+    {
+        if (arpNotes[i] == note)
+        {
+            for (uint8_t j = i; j < sizeof(arpNotes) - 1; j++)
+            {
+                arpNotes[j] = arpNotes[j + 1];
+                arpVels[j] = arpVels[j + 1];
+            }
+            arpNotes[sizeof(arpNotes) - 1] = '\0';
+            return;
+        }
+    }
+}
 
 const static char *ARP_STYLES[6] = {"Up", "Down", "Bounce", "Up & Down", "Random", "Play Order"};
 const static char *ARP_CYCLES[5] = {"Inf", "1", "2", "3", "Hold"};
@@ -121,6 +178,9 @@ FLASHMEM void resetNotes()
     resetArp();
     for (uint8_t i = 0; i < sizeof(arpNotes); i++)
         arpNotes[i] = '\0';
+    // Keys still down are forgotten, so their note-offs are ignored by the arp
+    arpNotesHeld = 0;
+    memset(arpKeysHeld, 0, sizeof(arpKeysHeld));
 }
 
 FLASHMEM uint8_t getNotesInArp()
@@ -384,14 +444,15 @@ typedef struct SequenceStruct
     boolean running = false;
     boolean recording = false;
 
-    uint8_t note_in;
-    uint8_t note_in_velocity;
-    int8_t transpose;
+    uint8_t note_in = 0;
+    uint8_t note_in_velocity = 0;
 
     uint32_t tempo_us = 125'000; // 60s/bpm
 
-    uint8_t prev_note; // note_offs for every instrument track
-    uint8_t prev_vel;
+    // Initialised: a SequenceStruct made on the stack (missing sequence) had garbage here,
+    // so a note-off was sent for a random note
+    uint8_t prev_note = 0; // note_offs for every instrument track
+    uint8_t prev_vel = 0;
 } SequenceStruct;
 
 uint8_t currentSequenceIndex = 0;
@@ -439,6 +500,14 @@ FLASHMEM boolean loadSequence(uint8_t filename)
     currentSequence.UID = doc["UID"];
     currentSequence.bpm = doc["bpm"];
     currentSequence.length = doc["Length"];
+    // A bad file mustn't overrun the note arrays, stop the step wrapping or divide by zero
+    if (currentSequence.length < 1 || currentSequence.length > SEQ_PATTERN_LEN)
+        currentSequence.length = SEQ_PATTERN_LEN;
+    if (!(currentSequence.bpm >= 20.0f && currentSequence.bpm <= 300.0f))
+        currentSequence.bpm = 120.0f;
+    // The step carries on from the previous sequence if it's running; keep it in range
+    if (currentSequence.step >= currentSequence.length)
+        currentSequence.step = 0;
 
     JsonArray Notes = doc["Notes"];
     JsonArray Vel = doc["Vel"];
@@ -498,7 +567,8 @@ FLASHMEM void saveSequence()
     }
 }
 
-FLASHMEM char *getSequenceName(File file)
+// Returns a copy: the JsonDocument is on this function's stack (see getPatchName)
+FLASHMEM String getSequenceName(File file)
 {
     // Allocate a temporary JsonDocument
     // Don't forget to change the capacity to match your requirements.
@@ -511,10 +581,9 @@ FLASHMEM char *getSequenceName(File file)
     {
         if (DEBUG)
             Serial.println(F("getSequenceName() - Failed to read file"));
-        return "Failed to read file";
+        return F("Failed to read file");
     }
-    // Copy values from the JsonDocument to the SequenceStruct
-    return doc["Name"];
+    return String(doc["Name"] | "");
 }
 
 FLASHMEM void loadSequenceNames()
@@ -596,7 +665,7 @@ FLASHMEM uint8_t decSequenceIndex()
 FLASHMEM void seq_live_recording()
 {
     // record to sequencer if recording is active
-    if (currentSequence.note_in > 0 && currentSequence.recording)
+    if (currentSequence.note_in > 0 && currentSequence.recording && currentSequence.step < SEQ_PATTERN_LEN)
     {
         currentSequence.Notes[currentSequence.step] = currentSequence.note_in;
         currentSequence.Velocities[currentSequence.step] = currentSequence.note_in_velocity;
@@ -606,7 +675,9 @@ FLASHMEM void seq_live_recording()
     }
 }
 
-FLASHMEM void noteOnRoutine()
+// Sequencer/arpeggiator step code (run by the TeensyTimerTool TCK timer from yield(), on the
+// main thread) is kept in RAM for steady timing
+void noteOnRoutine()
 {
     if (arpRunning)
     {
@@ -617,6 +688,10 @@ FLASHMEM void noteOnRoutine()
             {
                 return;
             }
+            // Random only moves playBeat when it plays a note, so if the selected note was
+            // released, choose again (otherwise it went silent for good)
+            if (arpStyle == RANDOMPLAY && arpNotes[playBeat] == '\0')
+                randomPlay();
             if (arpNotes[playBeat] != '\0')
             {
                 if (!arpStarted)
@@ -693,16 +768,13 @@ FLASHMEM void noteOnRoutine()
     }
     else
     {
-        if (currentSequence.note_in > 0 && currentSequence.note_in < 62 && currentSequence.recording == false)
-        {
-            myNoteOff(midiChannel, currentSequence.Notes[currentSequence.step] + currentSequence.transpose, 0);
-            myNoteOff(midiChannel, currentSequence.Notes[currentSequence.step - 1] + currentSequence.transpose, 0);
-            if (currentSequence.note_in > 65)
-                currentSequence.note_in = currentSequence.note_in - 12;
-            currentSequence.transpose = currentSequence.note_in % 12;
-            currentSequence.transpose = currentSequence.transpose - 12;
+        // The length can change while running (or a shorter sequence be loaded): never step
+        // past it, or notes are read (and recorded) outside the pattern
+        if (currentSequence.step >= currentSequence.length)
+            currentSequence.step = 0;
+        // A note played just before recording was turned off isn't recorded later
+        if (!currentSequence.recording)
             currentSequence.note_in = 0;
-        }
 
         seq_live_recording();
 
@@ -722,13 +794,13 @@ FLASHMEM void noteOnRoutine()
 
         currentSequence.noteoffsent = false;
 
-        if (++currentSequence.step == currentSequence.length)
+        if (++currentSequence.step >= currentSequence.length)
             currentSequence.step = 0;
     }
     seqSwapper = false;
 }
 
-FLASHMEM void noteOffRoutine()
+void noteOffRoutine()
 {
     if (arpRunning)
     {
@@ -748,6 +820,9 @@ FLASHMEM void noteOffRoutine()
                 {
                     myNoteOff(midiChannel, currentSequence.prev_note, 0);
                     currentSequence.noteoffsent = true;
+                    // Sent once: repeating it on every empty step cut off the same note
+                    // played live on the keyboard
+                    currentSequence.prev_note = 0;
                 }
             }
         }
@@ -756,7 +831,7 @@ FLASHMEM void noteOffRoutine()
 }
 
 // Runs in Interrupt Timer. Switches between the Noteon and Noteoff Task, each cycle
-FLASHMEM void sequencer()
+void sequencer()
 {
     // if (currentSequence.running && state == SEQUENCEEDIT)
     //     currentSequence.recording = true;

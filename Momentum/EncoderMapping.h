@@ -17,9 +17,17 @@ typedef struct EncoderMappingStruct
 
 EncoderMappingStruct encMap[4] = {};
 
+// The encoder value is a byte, but tempo goes up to 300bpm (and higher from MIDI clock).
+// Only the text is shown; clamp the byte, as converting an out of range float is undefined.
+inline uint8_t bpmToEncValue(float bpm)
+{
+    return bpm <= 0.0f ? 0 : (bpm >= 255.0f ? 255 : (uint8_t)bpm);
+}
+
 // Sets the value and value string of the encoder when this parameter is on the display
 FLASHMEM boolean setEncValue(boolean act, uint8_t parameter, uint8_t value, String str, uint8_t newParameter)
 {
+    LockGuard lock(displayLock); // The display renders from encMap
     for (uint8_t i = 0; i < 4; i++)
     {
         if (encMap[i].Parameter == parameter)
@@ -40,6 +48,7 @@ FLASHMEM boolean setEncValue(boolean act, uint8_t parameter, uint8_t value, Stri
 
 FLASHMEM boolean setEncValue(uint8_t parameter, uint8_t value, uint8_t range, String str)
 {
+    LockGuard lock(displayLock); // The display renders from encMap
     // Extra routine for settings which have variable size ranges
     for (uint8_t i = 0; i < 4; i++)
     {
@@ -54,12 +63,14 @@ FLASHMEM boolean setEncValue(uint8_t parameter, uint8_t value, uint8_t range, St
 
 FLASHMEM boolean setEncValue(uint8_t parameter, uint8_t value, String str)
 {
+    LockGuard lock(displayLock); // The display renders from encMap
     return setEncValue(true, parameter, value, str, parameter);
 }
 
 // For turning off
 FLASHMEM boolean setEncInactive(uint8_t parameter)
 {
+    LockGuard lock(displayLock); // The display renders from encMap
     return setEncValue(false, parameter, 0, "", parameter);
 }
 
@@ -627,6 +638,20 @@ FLASHMEM void configureCCfilterres(EncoderMappingStruct *enc, State st = State::
     enc->PushAction = st;
 }
 
+// Filter type text: LP...HP mix, then HP fading into BP at the top of the knob, then BP
+FLASHMEM String filterMixerStr(float value)
+{
+    if (value == BANDPASS || value >= 2.0f)
+        return F("Band Pass");
+    if (value > 1.0f)
+        return F("High ") + String(100 - int(100 * (value - 1.0f) + 0.5f)) + F(" - ") + String(int(100 * (value - 1.0f) + 0.5f)) + F(" Band");
+    if (value == LOWPASS)
+        return F("Low Pass");
+    if (value == HIGHPASS)
+        return F("High Pass");
+    return F("Low ") + String(100 - int(100 * value)) + F(" - ") + String(int(100 * value)) + F(" High");
+}
+
 FLASHMEM void configureCCfiltermixer(EncoderMappingStruct *enc, State st = State::MAIN)
 {
     enc->active = true;
@@ -634,26 +659,7 @@ FLASHMEM void configureCCfiltermixer(EncoderMappingStruct *enc, State st = State
     enc->ShowValue = true;
     enc->Value = currentPatch.FilterMixer;
     enc->DefaultValue = 0;
-    if (groupvec[activeGroupIndex]->getFilterMixer() == BANDPASS)
-    {
-        enc->ValueStr = "Band Pass";
-    }
-    else
-    {
-        // LP-HP mix mode - a notch filter
-        if (groupvec[activeGroupIndex]->getFilterMixer() == LOWPASS)
-        {
-            enc->ValueStr = "Low Pass";
-        }
-        else if (groupvec[activeGroupIndex]->getFilterMixer() == HIGHPASS)
-        {
-            enc->ValueStr = "High Pass";
-        }
-        else
-        {
-            enc->ValueStr = "Low " + String(100 - int(100 * groupvec[activeGroupIndex]->getFilterMixer())) + " - " + String(int(100 * groupvec[activeGroupIndex]->getFilterMixer())) + " High";
-        }
-    }
+    enc->ValueStr = filterMixerStr(groupvec[activeGroupIndex]->getFilterMixer());
     enc->Range = 127;
     enc->ParameterStr = ParameterStrMap[CCfiltermixer];
     enc->Push = true;
@@ -787,13 +793,47 @@ FLASHMEM void configureCCfilterlforetrig(EncoderMappingStruct *enc, State st = S
     enc->PushAction = st;
 }
 
+// Push defaults for the FX encoders: a usable starting point rather than 0 (effect off)
+#define ENSEMBLE_RATE_DEFAULT 28    // 6.0Hz
+#define ENSEMBLE_MIX_DEFAULT 64     // 50%
+#define ENSEMBLE_DEPTH_DEFAULT 64   // 100%, the original depth
+
+// Ensemble depth knob (0-127) to depth: 25% - 100% - 200%, 64 = 100% (the original)
+inline float ensembleDepth(uint8_t value)
+{
+    return value < 64 ? 0.25f + 0.75f * value / 64.0f : 1.0f + (value - 64) / 63.0f;
+}
+#define ENSEMBLE_DELAY_DEFAULT 64   // 11.6ms, the original delay
+
+// Ensemble delay knob (0-127) to samples: 2 - 40ms, 64 = 512 samples (11.6ms, the original).
+// Exponential either side of the middle, so each step is a similar change in character:
+// flanging at the bottom, ensemble in the middle, doubling at the top.
+inline float ensembleDelaySamples(uint8_t value)
+{
+    const float shortest = 0.002f * AUDIO_SAMPLE_RATE_EXACT; // 2ms
+    const float longest = 0.040f * AUDIO_SAMPLE_RATE_EXACT;  // 40ms
+    if (value < 64)
+        return shortest * powf(512.0f / shortest, value / 64.0f);
+    return 512.0f * powf(longest / 512.0f, (value - 64) / 63.0f);
+}
+
+// Delay text for the display: the delay in use, which the depth may lengthen at the bottom
+inline String ensembleDelayStr()
+{
+    return String(groupvec[activeGroupIndex]->getEnsembleEffectDelayMs(), 1) + " ms";
+}
+#define REVERB_SIZE_DEFAULT 64      // 0.5
+#define REVERB_MIX_DEFAULT 64       // 0.5 (25% wet: the mix goes up to 50:50)
+#define REVERB_DAMPING_DEFAULT 64   // 50%, the previous fixed setting
+#define REVERB_BASSCUT_DEFAULT 26   // 20%, the previous fixed setting
+
 FLASHMEM void configureCCensemblefxamt(EncoderMappingStruct *enc, State st = State::MAIN)
 {
     enc->active = true;
     enc->Parameter = CCensemblefxamt;
     enc->ShowValue = true;
     enc->Value = currentPatch.EnsembleEffectAmt;
-    enc->DefaultValue = 0;
+    enc->DefaultValue = ENSEMBLE_RATE_DEFAULT;
     enc->ValueStr = String(ENSEMBLE_LFO[currentPatch.EnsembleEffectAmt]) + " Hz";
     enc->Range = 127;
     enc->ParameterStr = ParameterStrMap[CCensemblefxamt];
@@ -807,7 +847,7 @@ FLASHMEM void configureCCensemblefxmix(EncoderMappingStruct *enc, State st = Sta
     enc->Parameter = CCensemblefxmix;
     enc->ShowValue = true;
     enc->Value = currentPatch.EnsembleEffectMix;
-    enc->DefaultValue = 0;
+    enc->DefaultValue = ENSEMBLE_MIX_DEFAULT;
     enc->ValueStr = String(groupvec[activeGroupIndex]->getEnsembleEffectMix());
     enc->Range = 127;
     enc->ParameterStr = ParameterStrMap[CCensemblefxmix];
@@ -821,7 +861,7 @@ FLASHMEM void configureCCreverbfxtime(EncoderMappingStruct *enc, State st = Stat
     enc->Parameter = CCreverbfxtime;
     enc->ShowValue = true;
     enc->Value = currentPatch.ReverbEffectTime;
-    enc->DefaultValue = 0;
+    enc->DefaultValue = REVERB_SIZE_DEFAULT;
     enc->ValueStr = String(LINEAR[currentPatch.ReverbEffectTime]);
     enc->Range = 127;
     enc->ParameterStr = ParameterStrMap[CCreverbfxtime];
@@ -835,10 +875,66 @@ FLASHMEM void configureCCreverbfxmix(EncoderMappingStruct *enc, State st = State
     enc->Parameter = CCreverbfxmix;
     enc->ShowValue = true;
     enc->Value = currentPatch.ReverbEffectMix;
-    enc->DefaultValue = 0;
+    enc->DefaultValue = REVERB_MIX_DEFAULT;
     enc->ValueStr = String(groupvec[activeGroupIndex]->getReverbEffectMix());
     enc->Range = 127;
     enc->ParameterStr = ParameterStrMap[CCreverbfxmix];
+    enc->Push = true;
+    enc->PushAction = st;
+}
+
+FLASHMEM void configureCCensemblefxdepth(EncoderMappingStruct *enc, State st = State::MAIN)
+{
+    enc->active = true;
+    enc->Parameter = CCensemblefxdepth;
+    enc->ShowValue = true;
+    enc->Value = currentPatch.EnsembleEffectDepth;
+    enc->DefaultValue = ENSEMBLE_DEPTH_DEFAULT;
+    enc->ValueStr = String(int(ensembleDepth(currentPatch.EnsembleEffectDepth) * 100 + 0.5f)) + "%";
+    enc->Range = 127;
+    enc->ParameterStr = ParameterStrMap[CCensemblefxdepth];
+    enc->Push = true;
+    enc->PushAction = st;
+}
+
+FLASHMEM void configureCCensemblefxdelay(EncoderMappingStruct *enc, State st = State::MAIN)
+{
+    enc->active = true;
+    enc->Parameter = CCensemblefxdelay;
+    enc->ShowValue = true;
+    enc->Value = currentPatch.EnsembleEffectDelay;
+    enc->DefaultValue = ENSEMBLE_DELAY_DEFAULT;
+    enc->ValueStr = ensembleDelayStr();
+    enc->Range = 127;
+    enc->ParameterStr = ParameterStrMap[CCensemblefxdelay];
+    enc->Push = true;
+    enc->PushAction = st;
+}
+
+FLASHMEM void configureCCreverbfxdamping(EncoderMappingStruct *enc, State st = State::MAIN)
+{
+    enc->active = true;
+    enc->Parameter = CCreverbfxdamping;
+    enc->ShowValue = true;
+    enc->Value = currentPatch.ReverbEffectDamping;
+    enc->DefaultValue = REVERB_DAMPING_DEFAULT;
+    enc->ValueStr = String(int(currentPatch.ReverbEffectDamping * 100 / 128.0f + 0.5f)) + "%";
+    enc->Range = 127;
+    enc->ParameterStr = ParameterStrMap[CCreverbfxdamping];
+    enc->Push = true;
+    enc->PushAction = st;
+}
+
+FLASHMEM void configureCCreverbfxbasscut(EncoderMappingStruct *enc, State st = State::MAIN)
+{
+    enc->active = true;
+    enc->Parameter = CCreverbfxbasscut;
+    enc->ShowValue = true;
+    enc->Value = currentPatch.ReverbEffectBassCut;
+    enc->DefaultValue = REVERB_BASSCUT_DEFAULT;
+    enc->ValueStr = String(int(currentPatch.ReverbEffectBassCut * 100 / 128.0f + 0.5f)) + "%";
+    enc->Range = 127;
+    enc->ParameterStr = ParameterStrMap[CCreverbfxbasscut];
     enc->Push = true;
     enc->PushAction = st;
 }
@@ -1059,6 +1155,7 @@ FLASHMEM void setDefaultValue(EncoderMappingStruct *enc)
 // groupvec[activeGroupIndex]->XXX stores absolute, real values
 FLASHMEM void setEncodersState(State s)
 {
+    LockGuard lock(displayLock); // The display renders from encMap
     switch (s)
     {
     case State::MAIN:
@@ -1180,14 +1277,14 @@ FLASHMEM void setEncodersState(State s)
         configureglideshape(&encMap[ENC_BR], State::AMPPAGE3);
         break;
     case State::FXPAGE1:
-        configureOff(&encMap[ENC_TL]);
-        configureOff(&encMap[ENC_TR]);
+        configureCCensemblefxdepth(&encMap[ENC_TL], State::FXPAGE1);
+        configureCCensemblefxdelay(&encMap[ENC_TR], State::FXPAGE1);
         configureCCensemblefxamt(&encMap[ENC_BL], State::FXPAGE1);
         configureCCensemblefxmix(&encMap[ENC_BR], State::FXPAGE1);
         break;
     case State::FXPAGE2:
-        configureOff(&encMap[ENC_TL]);
-        configureOff(&encMap[ENC_TR]);
+        configureCCreverbfxdamping(&encMap[ENC_TL], State::FXPAGE2);
+        configureCCreverbfxbasscut(&encMap[ENC_TR], State::FXPAGE2);
         configureCCreverbfxtime(&encMap[ENC_BL], State::FXPAGE2);
         configureCCreverbfxmix(&encMap[ENC_BR], State::FXPAGE2);
         break;
@@ -1591,7 +1688,7 @@ FLASHMEM void setEncodersState(State s)
         encMap[ENC_TL].Parameter = SeqTempo;
         encMap[ENC_TL].ShowValue = true;
         encMap[ENC_TL].ValueStr = String(currentSequence.bpm, 1);
-        encMap[ENC_TL].Value = currentSequence.bpm;
+        encMap[ENC_TL].Value = bpmToEncValue(currentSequence.bpm);
         encMap[ENC_TL].Range = 255;
         encMap[ENC_TL].DefaultValue = 120;
         encMap[ENC_TL].ParameterStr = ParameterStrMap[SeqTempo];
@@ -1719,7 +1816,7 @@ FLASHMEM void setEncodersState(State s)
         encMap[ENC_TL].Parameter = SeqTempo;
         encMap[ENC_TL].ShowValue = true;
         encMap[ENC_TL].ValueStr = String(currentSequence.bpm, 1);
-        encMap[ENC_TL].Value = currentSequence.bpm;
+        encMap[ENC_TL].Value = bpmToEncValue(currentSequence.bpm);
         encMap[ENC_TL].Range = 255;
         encMap[ENC_TL].DefaultValue = 120;
         encMap[ENC_TL].ParameterStr = ParameterStrMap[SeqTempo];
@@ -1754,7 +1851,7 @@ FLASHMEM void setEncodersState(State s)
         encMap[ENC_TL].Parameter = SeqTempo;
         encMap[ENC_TL].ShowValue = false; // value is shown in a different position
         encMap[ENC_TL].ValueStr = String(currentSequence.bpm, 1);
-        encMap[ENC_TL].Value = currentSequence.bpm;
+        encMap[ENC_TL].Value = bpmToEncValue(currentSequence.bpm);
         encMap[ENC_TL].Range = 255;
         encMap[ENC_TL].DefaultValue = 120;
         encMap[ENC_TL].ParameterStr = ParameterStrMap[SeqTempo];
@@ -1900,6 +1997,38 @@ FLASHMEM void setEncodersState(State s)
 
         encMap[ENC_BR].active = false;
         break;
+    case State::FIRMWARECONFIRM:
+        // SD card firmware update: Cancel (bottom left) or Update (bottom right)
+        configureOff(&encMap[ENC_TL]);
+        configureOff(&encMap[ENC_TR]);
+        encMap[ENC_BL].active = true;
+        encMap[ENC_BL].Parameter = firmwarecancel;
+        encMap[ENC_BL].ShowValue = false;
+        encMap[ENC_BL].Value = 0;
+        encMap[ENC_BL].Range = 127;
+        encMap[ENC_BL].ValueStr = "";
+        encMap[ENC_BL].ParameterStr = ParameterStrMap[firmwarecancel];
+        encMap[ENC_BL].Push = true;
+        encMap[ENC_BL].PushAction = State::MAIN;
+        encMap[ENC_BR].active = true;
+        encMap[ENC_BR].Parameter = firmwareupdate;
+        encMap[ENC_BR].ShowValue = false;
+        encMap[ENC_BR].Value = 0;
+        encMap[ENC_BR].Range = 127;
+        encMap[ENC_BR].ValueStr = "";
+        encMap[ENC_BR].ParameterStr = ParameterStrMap[firmwareupdate];
+        encMap[ENC_BR].Push = true;
+        encMap[ENC_BR].PushAction = State::FIRMWAREUPDATE;
+        break;
+    case State::FIRMWAREUPDATE:
+    case State::FIRMWAREINSTALL:
+    case State::FIRMWAREUPDATE_ABORT:
+    case State::FIRMWAREDELETE:
+        configureOff(&encMap[ENC_TL]);
+        configureOff(&encMap[ENC_TR]);
+        configureOff(&encMap[ENC_BL]);
+        configureOff(&encMap[ENC_BR]);
+        break;
     default:
         break;
     }
@@ -1907,6 +2036,7 @@ FLASHMEM void setEncodersState(State s)
 
 FLASHMEM void setConfigurationForCC(uint8_t enc, uint8_t cc)
 {
+    LockGuard lock(displayLock); // The display renders from encMap
     switch (cc)
     {
     case CCunison:
@@ -2049,6 +2179,18 @@ FLASHMEM void setConfigurationForCC(uint8_t enc, uint8_t cc)
         break;
     case CCreverbfxmix:
         configureCCreverbfxmix(&encMap[enc], State::PERFORMANCEPAGE);
+        break;
+    case CCensemblefxdepth:
+        configureCCensemblefxdepth(&encMap[enc], State::PERFORMANCEPAGE);
+        break;
+    case CCensemblefxdelay:
+        configureCCensemblefxdelay(&encMap[enc], State::PERFORMANCEPAGE);
+        break;
+    case CCreverbfxdamping:
+        configureCCreverbfxdamping(&encMap[enc], State::PERFORMANCEPAGE);
+        break;
+    case CCreverbfxbasscut:
+        configureCCreverbfxbasscut(&encMap[enc], State::PERFORMANCEPAGE);
         break;
     case CCvelocitySens:
         configureCCAmpVelocitySens(&encMap[enc], State::PERFORMANCEPAGE);

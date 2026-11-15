@@ -108,7 +108,9 @@ FLASHMEM Patches getPatchesCopy()
 }
 
 // Patchname from a files and return it
-FLASHMEM char *getPatchName(File file)
+// Returns a copy: the JsonDocument is on this function's stack, so a pointer into it was
+// left dangling (and could be overwritten by an interrupt before the caller copied it)
+FLASHMEM String getPatchName(File file)
 {
 
   if (DEBUG)
@@ -124,14 +126,13 @@ FLASHMEM char *getPatchName(File file)
   {
     if (DEBUG)
       Serial.println(F("getPatchName() - Failed to read file"));
-    return 0;
+    return String();
   }
-  // Copy values from the JsonDocument to the PatchStruct
-  return doc["PatchName"];
+  return String(doc["PatchName"] | "");
 }
 
 // Patchname from a UID and return it
-FLASHMEM char *getPatchName(uint8_t bankIndex, uint32_t uid)
+FLASHMEM String getPatchName(uint8_t bankIndex, uint32_t uid)
 {
   char result[30];
   concatBankAndUID(bankIndex, uid, result);
@@ -140,7 +141,7 @@ FLASHMEM char *getPatchName(uint8_t bankIndex, uint32_t uid)
   File file = SD.open(result);
   if (!file)
     return MISSINGNAME;
-  char *patchName = getPatchName(file);
+  String patchName = getPatchName(file);
   file.close();
   return patchName;
 }
@@ -345,7 +346,8 @@ FLASHMEM boolean loadPatch(uint8_t bank, uint32_t filename)
     return false;
   }
   // Copy values from the JsonDocument to the PatchStruct
-  strncpy(currentPatch.PatchName, doc["PatchName"], sizeof(currentPatch.PatchName));
+  // Always terminated, and a missing name (null) doesn't crash
+  strlcpy(currentPatch.PatchName, doc["PatchName"] | "", sizeof(currentPatch.PatchName));
   currentPatch.UID = doc["UID"];
 
   JsonObject OSC1 = doc["OSC1"];
@@ -408,6 +410,11 @@ FLASHMEM boolean loadPatch(uint8_t bank, uint32_t filename)
   currentPatch.EnsembleEffectMix = doc["EnsembleEffectMix"];
   currentPatch.ReverbEffectTime = doc["ReverbEffectTime"];
   currentPatch.ReverbEffectMix = doc["ReverbEffectMix"];
+  // Added later: patches saved before have no value, so use the defaults (the old fixed settings)
+  currentPatch.EnsembleEffectDepth = doc["EnsembleEffectDepth"] | 64;
+  currentPatch.EnsembleEffectDelay = doc["EnsembleEffectDelay"] | 64;
+  currentPatch.ReverbEffectDamping = doc["ReverbEffectDamping"] | 64;
+  currentPatch.ReverbEffectBassCut = doc["ReverbEffectBassCut"] | 26;
   currentPatch.FilterEnvShape = doc["FilterEnvShape"];
   currentPatch.AmpEnvShape = doc["AmpEnvShape"];
   currentPatch.GlideShape = doc["GlideShape"];
@@ -521,6 +528,10 @@ FLASHMEM boolean savePatch(uint8_t bankIndex, uint8_t index)
   doc["EnsembleEffectMix"] = currentPatch.EnsembleEffectMix;
   doc["ReverbEffectTime"] = currentPatch.ReverbEffectTime;
   doc["ReverbEffectMix"] = currentPatch.ReverbEffectMix;
+  doc["EnsembleEffectDepth"] = currentPatch.EnsembleEffectDepth;
+  doc["EnsembleEffectDelay"] = currentPatch.EnsembleEffectDelay;
+  doc["ReverbEffectDamping"] = currentPatch.ReverbEffectDamping;
+  doc["ReverbEffectBassCut"] = currentPatch.ReverbEffectBassCut;
   doc["FilterEnvShape"] = currentPatch.FilterEnvShape;
   doc["AmpEnvShape"] = currentPatch.AmpEnvShape;
   doc["GlideShape"] = currentPatch.GlideShape;

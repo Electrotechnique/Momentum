@@ -53,6 +53,10 @@
 #define CCpwmSourceB 108         // Osc2 LFO/Filter Env
 #define CCvelocitySens 109       // Velocity sensitivity
 #define CCFilterVelocitySens 110 // Filter Velocity sensitivity
+#define CCensemblefxdepth 111    // Ensemble modulation depth
+#define CCensemblefxdelay 112    // Ensemble delay time
+#define CCreverbfxdamping 113    // Reverb tail damping (treble loss)
+#define CCreverbfxbasscut 114    // Reverb tail bass cut
 #define CCallnotesoff 123        // Panic button includes sound off
 #define CCmonomode 126
 

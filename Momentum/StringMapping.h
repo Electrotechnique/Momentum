@@ -2,7 +2,7 @@
 #include "Constants.h"
 #include "MidiCC.h"
 
-const uint8_t PARAMETERSFORENCS = 56;
+const uint8_t PARAMETERSFORENCS = 60;
 const char *ParameterStrMap[256] = {};
 uint8_t ParametersForPerformanceEncoders[PARAMETERSFORENCS] = {};
 
@@ -49,6 +49,12 @@ FLASHMEM void assignStrings()
     ParameterStrMap[CCensemblefxmix] = "Ensemble Mix";
     ParameterStrMap[CCreverbfxtime] = "Room Size";
     ParameterStrMap[CCreverbfxmix] = "Reverb Mix";
+    ParameterStrMap[CCensemblefxdepth] = "Ensemble Depth";
+    ParameterStrMap[CCensemblefxdelay] = "Ensemble Delay";
+    ParameterStrMap[CCreverbfxdamping] = "Reverb Damping";
+    ParameterStrMap[CCreverbfxbasscut] = "Reverb Bass Cut";
+    ParameterStrMap[firmwareupdate] = "Update";
+    ParameterStrMap[firmwarecancel] = "Cancel";
     ParameterStrMap[CCdetune] = "Detune";
     ParameterStrMap[CCoscLfoRate] = "Pitch LFO Rate";
     ParameterStrMap[CCoscLfoWaveform] = "Pitch LFO Wave";
@@ -177,6 +183,11 @@ FLASHMEM void assignParametersForPerformanceEncoders()
     ParametersForPerformanceEncoders[++i] = glideshape;
     ParametersForPerformanceEncoders[++i] = pitchbendrange;
     ParametersForPerformanceEncoders[++i] = pitchmodwheeldepth;
+    // Added at the end so the existing entries keep their positions
+    ParametersForPerformanceEncoders[++i] = CCensemblefxdepth;
+    ParametersForPerformanceEncoders[++i] = CCensemblefxdelay;
+    ParametersForPerformanceEncoders[++i] = CCreverbfxdamping;
+    ParametersForPerformanceEncoders[++i] = CCreverbfxbasscut;
 }
 
 FLASHMEM uint8_t getIndexForParametersForPerformanceEncoders(uint8_t cc)
