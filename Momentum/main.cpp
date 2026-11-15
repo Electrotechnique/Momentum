@@ -24,6 +24,7 @@
 ------------------------------------------------
             ELECTROTECHNIQUE MOMENTUM
   Teensy MicroMod based Synthesizer - 12 voices
+  Firmware Rev 2.00
 ------------------------------------------------
 
   Arduino IDE Tools Settings:
