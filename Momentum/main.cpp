@@ -2229,7 +2229,7 @@ FLASHMEM void encoderButtonCallback(unsigned enc_idx, int buttonState)
             break;
         case savepatch:
             state = State::SAVE;
-            strncpy(currentPatch.PatchName, currentPatchName.c_str(), 64);
+            strlcpy(currentPatch.PatchName, currentPatchName.c_str(), sizeof(currentPatch.PatchName)); // Always terminated
             savePatch(currentBankIndex, currentPatchIndex);
             updatePatchnameAndIndex(currentPatch.PatchName, currentPatchIndex + 1, currentPatch.UID);
             recallPatch(currentBankIndex, patches[currentPatchIndex].patchUID);
@@ -2429,6 +2429,12 @@ FLASHMEM void encoderButtonCallback(unsigned enc_idx, int buttonState)
         setEncodersState(state);
     }
 }
+
+// Reinitialise to panel: state shown for this long, then restored (see buttonCallback)
+#define REINIT_STATE_MS 250
+State reinitRestoreState = State::MAIN;
+bool reinitRestorePending = false;
+elapsedMillis reinitRestoreTimer;
 
 // Read and drop everything waiting in the MIDI inputs, so a backlog from a flood of MIDI
 // doesn't keep playing after Panic. Bounded in time in case the sender keeps going.
@@ -3076,7 +3082,7 @@ FLASHMEM void buttonCallback(unsigned button_idx, int buttonStatus)
             {
                 // Save after patch naming
                 state = State::SAVE;
-                strncpy(currentPatch.PatchName, currentPatchName.c_str(), 64);
+                strlcpy(currentPatch.PatchName, currentPatchName.c_str(), sizeof(currentPatch.PatchName)); // Always terminated
                 savePatch(currentBankIndex, currentPatchIndex);
                 updatePatchnameAndIndex(currentPatch.PatchName, currentPatchIndex + 1, currentPatch.UID);
                 recallPatch(currentBankIndex, patches[currentPatchIndex].patchUID);
@@ -3167,12 +3173,15 @@ FLASHMEM void buttonCallback(unsigned button_idx, int buttonStatus)
             if (state != State::PATCHLIST)
             {
                 // Reinitialise to default patch
-                State prevState = state;
+                reinitRestoreState = state;
                 state = State::REINITIALISE;
                 reinitialisePatch();
                 setCurrentPatchData();
-                flashLED(GREEN, 8, 250);
-                state = prevState;
+                flashLED(GREEN, 8, REINIT_STATE_MS);
+                // The previous state comes back after REINIT_STATE_MS (from loop()), so the
+                // display shows the reinitialise message, without stopping the main loop
+                reinitRestorePending = true;
+                reinitRestoreTimer = 0;
             }
             else
             {
@@ -3435,6 +3444,14 @@ void loop()
                 MIDIClkSignal = false;
         }
         crashReportCheck();
+        eepromFlushDeferred(); // Settings that were changing, once they've been still
+        serviceLEDFlash();
+        if (reinitRestorePending && reinitRestoreTimer >= REINIT_STATE_MS)
+        {
+            reinitRestorePending = false;
+            if (state == State::REINITIALISE)
+                state = reinitRestoreState;
+        }
         // Uncomment for CPU (total and by group), audio memory and display stack, once a second
         // CPUMonitor();
         loopCount = 0;

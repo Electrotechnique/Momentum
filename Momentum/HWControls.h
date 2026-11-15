@@ -167,14 +167,31 @@ FLASHMEM void seqLED(ledColour color, int8_t ledNo)
     lightRGLEDs(LED_TO_BIN[currentRLEDs], LED_TO_BIN[ledNo] + LED_TO_BIN[currentGLEDs]);
 }
 
+// Lights an LED for duration ms on top of the current ones. Doesn't wait: serviceLEDFlash()
+// (called from loop()) restores the LEDs. It used to delay(), stopping the main loop - and
+// MIDI - for 250ms after Panic.
+bool ledFlashActive = false;
+elapsedMillis ledFlashTime;
+uint32_t ledFlashDuration = 0;
+
 FLASHMEM void flashLED(ledColour color, int8_t ledNo, int duration)
 {
   if (color == RED)
     lightRGLEDs(LED_TO_BIN[ledNo] + LED_TO_BIN[currentRLEDs], LED_TO_BIN[currentGLEDs]);
   else
     lightRGLEDs(LED_TO_BIN[currentRLEDs], LED_TO_BIN[ledNo] + LED_TO_BIN[currentGLEDs]);
-  delay(duration);
-  lightRGLEDs(LED_TO_BIN[currentRLEDs], LED_TO_BIN[currentGLEDs]);
+  ledFlashActive = true;
+  ledFlashTime = 0;
+  ledFlashDuration = duration;
+}
+
+FLASHMEM void serviceLEDFlash()
+{
+  if (ledFlashActive && ledFlashTime >= ledFlashDuration)
+  {
+    ledFlashActive = false;
+    lightRGLEDs(LED_TO_BIN[currentRLEDs], LED_TO_BIN[currentGLEDs]);
+  }
 }
 
 FLASHMEM void ledAnimation(long millis)

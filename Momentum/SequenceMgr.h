@@ -567,7 +567,8 @@ FLASHMEM void saveSequence()
     }
 }
 
-FLASHMEM char *getSequenceName(File file)
+// Returns a copy: the JsonDocument is on this function's stack (see getPatchName)
+FLASHMEM String getSequenceName(File file)
 {
     // Allocate a temporary JsonDocument
     // Don't forget to change the capacity to match your requirements.
@@ -580,10 +581,9 @@ FLASHMEM char *getSequenceName(File file)
     {
         if (DEBUG)
             Serial.println(F("getSequenceName() - Failed to read file"));
-        return "Failed to read file";
+        return F("Failed to read file");
     }
-    // Copy values from the JsonDocument to the SequenceStruct
-    return doc["Name"];
+    return String(doc["Name"] | "");
 }
 
 FLASHMEM void loadSequenceNames()
