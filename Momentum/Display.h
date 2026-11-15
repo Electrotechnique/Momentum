@@ -82,6 +82,11 @@ const uint32_t encTriColour[4] = {ILI9341_LIGHTBLUE, ILI9341_YELLOW, ILI9341_WHI
 unsigned long timer = 0;
 boolean updateDisplay = true;
 
+// SD card firmware update (FirmwareUpdate.h)
+String fwFileVersion = "";      // version in the firmware file on the SD card
+String fwMessage = "";          // reason, if the update failed
+volatile uint8_t fwProgress = 0; // % of the file read and written
+
 void startTimer()
 {
   timer = millis();
@@ -1698,25 +1703,63 @@ FLASHMEM void renderSettingsPage()
   renderCorners();
 }
 
+// Firmware file found on the SD card at power up: Update or Cancel
+FLASHMEM void renderFirmwareConfirmPage()
+{
+  tft.fillScreen(ILI9341_BLACK);
+  tft.setFont(Arial_16);
+  tft.setTextDatum(TC_DATUM);
+  tft.setTextColor(ILI9341_ORANGE);
+  tft.drawString("Firmware Update Found", 160, 70);
+  tft.setTextColor(ILI9341_WHITE);
+  tft.drawString(String(VERSION) + "  ->  " + fwFileVersion, 160, 105);
+  tft.setFont(Arial_12);
+  tft.setTextColor(ILI9341_MIDGREY);
+  tft.drawString("Installed  ->  " + String(FW_FILE_NAME), 160, 135);
+  renderCorners();
+}
+
 FLASHMEM void renderFirmwareUpdatePage()
 {
   tft.fillScreen(ILI9341_BLACK);
   tft.setFont(Arial_16);
   tft.setTextColor(ILI9341_ORANGE);
   tft.setTextDatum(TC_DATUM);
-  tft.drawString("Updating Firmware", 160, 150);
+  tft.drawString("Updating Firmware " + fwFileVersion, 160, 80);
+  // Progress bar
+  tft.drawRect(60, 120, 200, 16, ILI9341_WHITE);
+  tft.fillRect(62, 122, (196 * fwProgress) / 100, 12, ILI9341_ORANGE);
+  tft.setFont(Arial_12);
+  tft.setTextColor(ILI9341_MIDGREY);
+  tft.drawString("Do not power off", 160, 150);
 }
 
+// Last page before the new firmware is copied into place: the screen can't change after this
+FLASHMEM void renderFirmwareInstallPage()
+{
+  tft.fillScreen(ILI9341_BLACK);
+  tft.setFont(Arial_16);
+  tft.setTextColor(ILI9341_ORANGE);
+  tft.setTextDatum(TC_DATUM);
+  tft.drawString("Installing Firmware " + fwFileVersion, 160, 90);
+  tft.setTextColor(ILI9341_RED);
+  tft.drawString("Do not power off", 160, 120);
+  tft.setFont(Arial_12);
+  tft.setTextColor(ILI9341_MIDGREY);
+  tft.drawString("Momentum restarts when it's finished", 160, 150);
+}
+
+// First power up of the new firmware: the file has been deleted
 FLASHMEM void renderFirmwareDeletePage()
 {
   tft.fillScreen(ILI9341_BLACK);
   tft.setFont(Arial_16);
-  tft.setTextColor(ILI9341_RED);
+  tft.setTextColor(ILI9341_GREEN);
   tft.setTextDatum(TC_DATUM);
-  tft.drawString("Firmware Update Complete", 160, 110);
-  tft.setTextColor(ILI9341_ORANGE);
-  tft.drawString("Delete Firmware", 160, 130);
-  tft.drawString("File from SD Card", 160, 150);
+  tft.drawString("Firmware Updated to " + String(VERSION), 160, 100);
+  tft.setFont(Arial_12);
+  tft.setTextColor(ILI9341_MIDGREY);
+  tft.drawString(String(FW_FILE_NAME) + " deleted from SD card", 160, 135);
 }
 
 FLASHMEM void renderFirmwareUpdateAbortPage()
@@ -1725,7 +1768,13 @@ FLASHMEM void renderFirmwareUpdateAbortPage()
   tft.setFont(Arial_16);
   tft.setTextColor(ILI9341_RED);
   tft.setTextDatum(TC_DATUM);
-  tft.drawString("Aborting Firmware Update", 160, 110);
+  tft.drawString("Firmware Update Failed", 160, 80);
+  tft.setFont(Arial_12);
+  tft.setTextColor(ILI9341_WHITE);
+  tft.drawString(fwMessage, 160, 115);
+  tft.setTextColor(ILI9341_MIDGREY);
+  tft.drawString("The firmware is unchanged", 160, 145);
+  tft.drawString("File renamed " + String(FW_FILE_BAD), 160, 165);
 }
 
 FLASHMEM void showCurrentParameterOverlay2(const char *param, float val, int pType)
@@ -1988,6 +2037,13 @@ void displayThread()
         break;
       case State::FIRMWAREDELETE:
         renderFirmwareDeletePage();
+        break;
+      case State::FIRMWARECONFIRM:
+        renderFirmwareConfirmPage();
+        break;
+      case State::FIRMWAREINSTALL:
+        renderFirmwareInstallPage();
+        break;
       default:
         break;
       }

@@ -151,6 +151,7 @@ void buttonCallback(unsigned button_idx, int state);
 
 #include "Display.h"
 #include "Settings.h"
+#include "FirmwareUpdate.h"
 
 boolean firstPatchLoaded = false;
 
@@ -332,6 +333,8 @@ FLASHMEM void setup()
     setupDisplay();
     setEncodersState(state);
     setupHardware(encoderCallback, encoderButtonCallback, buttonCallback);
+    // Firmware update file on the SD card?
+    checkFirmwareFile();
 }
 
 // Specifically for Sequencer, bypassing recording note in and arp
@@ -2068,6 +2071,13 @@ FLASHMEM void encoderButtonCallback(unsigned enc_idx, int buttonState)
         case kbdScale:
             keyboardActive = !keyboardActive;
             break;
+        case firmwareupdate:
+            // Run from loop(): the update can't hold the display lock, or no progress is shown
+            firmwareUpdateRequested = true;
+            break;
+        case firmwarecancel:
+            renameFirmwareFile(FW_FILE_CANCELLED); // Not offered again until it's renamed back
+            break;
         case patchselect:
         case CCbankselectLSB:
             if (cardStatus)
@@ -3470,6 +3480,7 @@ void loop()
     // oscillators of voices that have stopped sounding
     groupvec[activeGroupIndex]->serviceVoices();
     checkPendingPatchRecall();
+    serviceFirmwareUpdate();
     static uint32_t overloadsReported = 0;
     if (global.cpuGuard.overloads != overloadsReported)
     {

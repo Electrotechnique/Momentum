@@ -73,6 +73,8 @@
 #define PerfDelete 189
 #define kbdOct 190
 #define kbdScale 191
+#define firmwareupdate 192 // SD card firmware update: confirm
+#define firmwarecancel 193 // SD card firmware update: cancel
 #define noencoder 255
 
 const static char *SEQUENCE_FOLDER_NAME = "Sequences";
@@ -103,6 +105,12 @@ const static char *MIDIThruStr[] = {"Off", "Full", "Same Ch.", "Diff. Ch."};
 const static char *CHARACTERS[TOTALCHARS] = {"A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P", "Q", "R", "S", "T", "U", "V", "W", "X", "Y", "Z", " ", "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q", "r", "s", "t", "u", "v", "w", "x", "y", "z", " ", "1", "2", "3", "4", "5", "6", "7", "8", "9", "0", "-", "!", "?", "+", ":"};
 
 extern const char *VERSION;
+extern const char FIRMWARE_MARKER[];  // "MOMENTUM_FW_VERSION:" followed by the version
+#define FIRMWARE_MARKER_PREFIX_LEN 20 // length of "MOMENTUM_FW_VERSION:"
+// SD card firmware update: file in the root of the SD card, renamed if cancelled or faulty
+#define FW_FILE_NAME "MOMENTUM.HEX"
+#define FW_FILE_CANCELLED "MOMENTUM.OLD"
+#define FW_FILE_BAD "MOMENTUM.BAD"
 extern const float PROGMEM FILTERFREQS256[256];
 extern const float POWER[128];
 extern const float NOTEFREQS[128];
@@ -220,7 +228,9 @@ typedef enum State
   CHOOSECHARBANK,        // Choose character
   DELETECHARBANK,        // Delete character
   DELETEBANKMSG,         // Delete bank message page
-  FIRMWAREUPDATE,        // Update firmware page
-  FIRMWAREDELETE,        // Delete firmware
-  FIRMWAREUPDATE_ABORT   // Update firmware abort page
+  FIRMWAREUPDATE,        // Update firmware page (reading the file, with progress)
+  FIRMWAREDELETE,        // Update complete, firmware file deleted
+  FIRMWAREUPDATE_ABORT,  // Update firmware abort page
+  FIRMWARECONFIRM,       // Firmware file found on the SD card: update or cancel
+  FIRMWAREINSTALL        // Copying the new firmware into place (no screen updates after this)
 } State;

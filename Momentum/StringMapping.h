@@ -53,6 +53,8 @@ FLASHMEM void assignStrings()
     ParameterStrMap[CCensemblefxdelay] = "Ensemble Delay";
     ParameterStrMap[CCreverbfxdamping] = "Reverb Damping";
     ParameterStrMap[CCreverbfxbasscut] = "Reverb Bass Cut";
+    ParameterStrMap[firmwareupdate] = "Update";
+    ParameterStrMap[firmwarecancel] = "Cancel";
     ParameterStrMap[CCdetune] = "Detune";
     ParameterStrMap[CCoscLfoRate] = "Pitch LFO Rate";
     ParameterStrMap[CCoscLfoWaveform] = "Pitch LFO Wave";

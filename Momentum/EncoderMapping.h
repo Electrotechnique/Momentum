@@ -1997,6 +1997,38 @@ FLASHMEM void setEncodersState(State s)
 
         encMap[ENC_BR].active = false;
         break;
+    case State::FIRMWARECONFIRM:
+        // SD card firmware update: Cancel (bottom left) or Update (bottom right)
+        configureOff(&encMap[ENC_TL]);
+        configureOff(&encMap[ENC_TR]);
+        encMap[ENC_BL].active = true;
+        encMap[ENC_BL].Parameter = firmwarecancel;
+        encMap[ENC_BL].ShowValue = false;
+        encMap[ENC_BL].Value = 0;
+        encMap[ENC_BL].Range = 127;
+        encMap[ENC_BL].ValueStr = "";
+        encMap[ENC_BL].ParameterStr = ParameterStrMap[firmwarecancel];
+        encMap[ENC_BL].Push = true;
+        encMap[ENC_BL].PushAction = State::MAIN;
+        encMap[ENC_BR].active = true;
+        encMap[ENC_BR].Parameter = firmwareupdate;
+        encMap[ENC_BR].ShowValue = false;
+        encMap[ENC_BR].Value = 0;
+        encMap[ENC_BR].Range = 127;
+        encMap[ENC_BR].ValueStr = "";
+        encMap[ENC_BR].ParameterStr = ParameterStrMap[firmwareupdate];
+        encMap[ENC_BR].Push = true;
+        encMap[ENC_BR].PushAction = State::FIRMWAREUPDATE;
+        break;
+    case State::FIRMWAREUPDATE:
+    case State::FIRMWAREINSTALL:
+    case State::FIRMWAREUPDATE_ABORT:
+    case State::FIRMWAREDELETE:
+        configureOff(&encMap[ENC_TL]);
+        configureOff(&encMap[ENC_TR]);
+        configureOff(&encMap[ENC_BL]);
+        configureOff(&encMap[ENC_BR]);
+        break;
     default:
         break;
     }
