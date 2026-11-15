@@ -107,10 +107,11 @@ const static char *CHARACTERS[TOTALCHARS] = {"A", "B", "C", "D", "E", "F", "G", 
 extern const char *VERSION;
 extern const char FIRMWARE_MARKER[];  // "MOMENTUM_FW_VERSION:" followed by the version
 #define FIRMWARE_MARKER_PREFIX_LEN 20 // length of "MOMENTUM_FW_VERSION:"
-// SD card firmware update: file in the root of the SD card, renamed if cancelled or faulty
-#define FW_FILE_NAME "MOMENTUM.HEX"
-#define FW_FILE_CANCELLED "MOMENTUM.OLD"
-#define FW_FILE_BAD "MOMENTUM.BAD"
+// SD card firmware update: any .hex file in the root of the SD card. Renamed to .old if the
+// update is cancelled, .bad if the file is faulty (keeping the rest of the name)
+#define FW_FILE_EXT ".hex"
+#define FW_FILE_CANCELLED_EXT ".old"
+#define FW_FILE_BAD_EXT ".bad"
 extern const float PROGMEM FILTERFREQS256[256];
 extern const float POWER[128];
 extern const float NOTEFREQS[128];

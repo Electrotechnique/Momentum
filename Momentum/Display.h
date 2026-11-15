@@ -83,7 +83,15 @@ unsigned long timer = 0;
 boolean updateDisplay = true;
 
 // SD card firmware update (FirmwareUpdate.h)
+String fwFileName = "";         // firmware file on the SD card
+String fwRenamedTo = "";        // what a faulty file was renamed to
 String fwFileVersion = "";      // version in the firmware file on the SD card
+
+// File name for the display, shortened if it wouldn't fit
+FLASHMEM String fwDisplayName(const String &name)
+{
+  return name.length() > 34 ? name.substring(0, 31) + "..." : name;
+}
 String fwMessage = "";          // reason, if the update failed
 volatile uint8_t fwProgress = 0; // % of the file read and written
 
@@ -1715,7 +1723,7 @@ FLASHMEM void renderFirmwareConfirmPage()
   tft.drawString(String(VERSION) + "  ->  " + fwFileVersion, 160, 105);
   tft.setFont(Arial_12);
   tft.setTextColor(ILI9341_MIDGREY);
-  tft.drawString("Installed  ->  " + String(FW_FILE_NAME), 160, 135);
+  tft.drawString(fwDisplayName(fwFileName), 160, 135);
   renderCorners();
 }
 
@@ -1759,7 +1767,8 @@ FLASHMEM void renderFirmwareDeletePage()
   tft.drawString("Firmware Updated to " + String(VERSION), 160, 100);
   tft.setFont(Arial_12);
   tft.setTextColor(ILI9341_MIDGREY);
-  tft.drawString(String(FW_FILE_NAME) + " deleted from SD card", 160, 135);
+  tft.drawString(fwDisplayName(fwFileName), 160, 135);
+  tft.drawString("deleted from SD card", 160, 155);
 }
 
 FLASHMEM void renderFirmwareUpdateAbortPage()
@@ -1774,7 +1783,7 @@ FLASHMEM void renderFirmwareUpdateAbortPage()
   tft.drawString(fwMessage, 160, 115);
   tft.setTextColor(ILI9341_MIDGREY);
   tft.drawString("The firmware is unchanged", 160, 145);
-  tft.drawString("File renamed " + String(FW_FILE_BAD), 160, 165);
+  tft.drawString("File renamed " + fwDisplayName(fwRenamedTo), 160, 165);
 }
 
 FLASHMEM void showCurrentParameterOverlay2(const char *param, float val, int pType)

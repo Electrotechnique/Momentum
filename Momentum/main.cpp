@@ -2076,7 +2076,7 @@ FLASHMEM void encoderButtonCallback(unsigned enc_idx, int buttonState)
             firmwareUpdateRequested = true;
             break;
         case firmwarecancel:
-            renameFirmwareFile(FW_FILE_CANCELLED); // Not offered again until it's renamed back
+            renameFirmwareFile(fwFileName, FW_FILE_CANCELLED_EXT); // Not offered again until it's renamed back
             break;
         case patchselect:
         case CCbankselectLSB:

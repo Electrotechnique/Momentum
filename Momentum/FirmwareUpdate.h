@@ -3,18 +3,21 @@
 
 // Firmware update from the SD card
 //
-// 1. Put the new firmware .hex file in the root of the SD card, named MOMENTUM.HEX
-// 2. At power up checkFirmwareFile() finds it and reads its version from the Momentum marker
-//    (FIRMWARE_MARKER in Constants.cpp) in the file's data:
-//    - a different version (newer or older) asks to update: Update or Cancel. Cancel renames
-//      the file MOMENTUM.OLD so it isn't offered again
-//    - the same version means the update has just been done: the file is deleted
-//    - no marker (not a Momentum firmware file): the file is renamed MOMENTUM.BAD
+// 1. Put the new firmware .hex file in the root of the SD card, with any name ending .hex
+//    (e.g. MomentumV2_45.hex)
+// 2. At power up checkFirmwareFile() looks at every .hex file in the root (not ._ files made
+//    by macOS) and reads its version from the Momentum marker (FIRMWARE_MARKER in
+//    Constants.cpp) in the file's data:
+//    - the same version as the running firmware: the update has just been done, so the file
+//      is deleted
+//    - no marker (not a Momentum firmware file) or damaged: renamed to .bad
+//    - a different version (newer or older): the first one found is offered, Update or
+//      Cancel. Cancel renames it to .old so it isn't offered again
 // 3. performFirmwareUpdate() reads the file into the unused flash above the running firmware,
 //    checking every line, the board (FlasherX target ID) and the Momentum marker and version.
 //    Any problem: the copy is erased, the running firmware carries on and the file is renamed
-//    MOMENTUM.BAD. Otherwise the copy replaces the running firmware (FlasherX flash_move),
-//    and Momentum restarts with the new firmware - which then deletes the file (step 2).
+//    to .bad. Otherwise the copy replaces the running firmware (FlasherX flash_move), and
+//    Momentum restarts with the new firmware - which then deletes the file (step 2).
 //
 // Saved settings in EEPROM are kept (see FLASH_RESERVE in FlashTxx.h); patches, performances
 // and sequences on the SD card aren't touched. If the power fails during the final copy the
@@ -138,10 +141,10 @@ FLASHMEM String versionAfterMarker(const char *p, const char *end)
 
 // Finds the Momentum marker in the data of a hex file and returns the version ("" if not found).
 // damaged is set if a line of the file is corrupt.
-FLASHMEM String readFirmwareFileVersion(bool &damaged)
+FLASHMEM String readFirmwareFileVersion(const String &fileName, bool &damaged)
 {
     damaged = false;
-    File f = SD.open(FW_FILE_NAME);
+    File f = SD.open(fileName.c_str());
     if (!f)
         return String();
     HexFileReader reader(f);
@@ -209,11 +212,24 @@ FLASHMEM String firmwareVersionInFlash(const char *start, uint32_t size)
     return String();
 }
 
-FLASHMEM void renameFirmwareFile(const char *newName)
+// Renames a firmware file to the same name with another extension, e.g. Momentum.hex -> Momentum.old.
+// Returns the new name.
+FLASHMEM String renameFirmwareFile(const String &fileName, const char *newExt)
 {
-    if (SD.exists(newName))
-        SD.remove(newName);
-    SD.rename(FW_FILE_NAME, newName);
+    int dot = fileName.lastIndexOf('.');
+    String newName = (dot > 0 ? fileName.substring(0, dot) : fileName) + newExt;
+    if (SD.exists(newName.c_str()))
+        SD.remove(newName.c_str());
+    SD.rename(fileName.c_str(), newName.c_str());
+    return newName;
+}
+
+// Firmware files: name ends .hex (any case), and not a ._ file made by macOS
+FLASHMEM bool isFirmwareFileName(const char *name)
+{
+    size_t n = strlen(name);
+    size_t e = strlen(FW_FILE_EXT);
+    return n > e && name[0] != '.' && strcasecmp(name + n - e, FW_FILE_EXT) == 0;
 }
 
 FLASHMEM void showFirmwarePage(State s)
@@ -224,29 +240,71 @@ FLASHMEM void showFirmwarePage(State s)
     fwPageTimer = 0;
 }
 
-// At power up: is there a firmware file on the SD card?
+// At power up: are there firmware files on the SD card?
+#define FW_MAX_FILES 8
 FLASHMEM void checkFirmwareFile()
 {
-    if (!cardStatus || !SD.exists(FW_FILE_NAME))
+    if (!cardStatus)
         return;
-    bool damaged;
-    String version = readFirmwareFileVersion(damaged);
-    if (version.length() == 0)
+    // Collect the names first: the directory isn't read while files are renamed or deleted
+    String names[FW_MAX_FILES];
+    int count = 0;
+    File root = SD.open("/");
+    if (!root)
+        return;
+    while (count < FW_MAX_FILES)
     {
-        fwMessage = damaged ? F("The file is damaged") : F("Not a Momentum firmware file");
-        renameFirmwareFile(FW_FILE_BAD);
-        showFirmwarePage(State::FIRMWAREUPDATE_ABORT);
-        return;
+        File entry = root.openNextFile();
+        if (!entry)
+            break;
+        if (!entry.isDirectory() && isFirmwareFileName(entry.name()))
+            names[count++] = entry.name();
+        entry.close();
     }
-    if (version == VERSION)
+    root.close();
+
+    String offerName, offerVersion, deletedName, badName, badMessage, badRenamedTo;
+    for (int i = 0; i < count; i++)
     {
-        // This firmware came from the file: the update worked
-        SD.remove(FW_FILE_NAME);
+        bool damaged;
+        String version = readFirmwareFileVersion(names[i], damaged);
+        if (version.length() == 0)
+        {
+            badName = names[i];
+            badMessage = damaged ? F("The file is damaged") : F("Not a Momentum firmware file");
+            badRenamedTo = renameFirmwareFile(names[i], FW_FILE_BAD_EXT);
+        }
+        else if (version == VERSION)
+        {
+            // This firmware came from the file: the update worked
+            SD.remove(names[i].c_str());
+            deletedName = names[i];
+        }
+        else if (offerName.length() == 0)
+        {
+            offerName = names[i];
+            offerVersion = version;
+        }
+    }
+
+    if (offerName.length() > 0)
+    {
+        fwFileName = offerName;
+        fwFileVersion = offerVersion;
+        showFirmwarePage(State::FIRMWARECONFIRM);
+    }
+    else if (deletedName.length() > 0)
+    {
+        fwFileName = deletedName;
         showFirmwarePage(State::FIRMWAREDELETE);
-        return;
     }
-    fwFileVersion = version;
-    showFirmwarePage(State::FIRMWARECONFIRM);
+    else if (badName.length() > 0)
+    {
+        fwFileName = badName;
+        fwMessage = badMessage;
+        fwRenamedTo = badRenamedTo;
+        showFirmwarePage(State::FIRMWAREUPDATE_ABORT);
+    }
 }
 
 // Update chosen (from loop(), not while holding the display lock, so progress is shown).
@@ -271,7 +329,7 @@ FLASHMEM void performFirmwareUpdate()
     uint32_t minAddr = 0xFFFFFFFF, maxAddr = 0;
     bool bufferInUse = false;
 
-    File f = SD.open(FW_FILE_NAME);
+    File f = SD.open(fwFileName.c_str());
     if (!f)
         err = "Can't open the file";
     else if (firmware_buffer_init(&bufAddr, &bufSize) != FLASH_BUFFER_TYPE)
@@ -346,7 +404,7 @@ FLASHMEM void performFirmwareUpdate()
         if (bufferInUse)
             firmware_buffer_free(bufAddr, bufSize);
         fwMessage = err;
-        renameFirmwareFile(FW_FILE_BAD);
+        fwRenamedTo = renameFirmwareFile(fwFileName, FW_FILE_BAD_EXT);
         // Sound back as it was
         for (uint8_t i = 0; i < 4; i++)
         {
